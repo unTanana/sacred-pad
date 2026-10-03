@@ -72,13 +72,17 @@ static void read_pad(void) {
         if (!xget) return;
     }
     XINPUT_STATE s;
+    static int seen = -1;
     for (DWORD i = 0; i < 4; i++) {
         if (xget(i, &s)) continue;
+        if (seen != (int)i) LOG("xinput: pad %lu connected", i), seen = i;
         XINPUT_GAMEPAD *g = &s.Gamepad;
         pad = (Pad){g->sThumbLX / 32767.f, g->sThumbLY / 32767.f, g->sThumbRX / 32767.f, g->sThumbRY / 32767.f,
                     g->bLeftTrigger / 255.f, g->bRightTrigger / 255.f, g->wButtons};
         deadzone(&pad.lx, &pad.ly, 0.24f);
         deadzone(&pad.rx, &pad.ry, 0.24f);
+        if (pad.lt < 0.1f) pad.lt = 0;
+        if (pad.rt < 0.1f) pad.rt = 0;
         return;
     }
 }
@@ -360,7 +364,31 @@ static void patch_call(DWORD at, void *fn) {
     VirtualProtect(p, 5, old, &old);
 }
 
+// Direct3D device setup (cDxDriver7, 0x645260): under Proton 11 the chosen device record's GUID pointer (+4) can
+// be stack garbage; the game then hands it to EnumZBufferFormats / CreateDevice and Proton's ddraw crashes on it.
+static char (__fastcall *device_setup)(void *, void *, BYTE *, void *, void *) = (void *)0x645260;
+static const GUID hal_device = {0x84e63de0, 0x46aa, 0x11cf, {0x81, 0x6f, 0x00, 0x00, 0xc0, 0x20, 0x15, 0x6e}};
+static char __fastcall h_device_setup(void *drv, void *edx, BYTE *rec, void *a2, void *a3) {
+    const GUID **dev = (const GUID **)(rec + 4);
+    if (IsBadReadPtr(*dev, sizeof(GUID))) LOG("device guid %p is bad: using the HAL device", (void *)*dev), *dev = &hal_device;
+    return device_setup(drv, edx, rec, a2, a3);
+}
+
+// Movies (intro, chapter transitions, extro) go through DirectShow's amstream, which crashes under Proton 11.
+// On Wine the opener (0x6a0d80, cdecl) reports "no stream", and every caller then skips the movie.
+static int __cdecl h_movie_open(void *a, void *b, void **stream) { return *stream = 0, E_FAIL; }
+
+static void patch_jmp(DWORD at, void *fn) {
+    BYTE *p = (BYTE *)at;
+    DWORD old;
+    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    p[0] = 0xE9, *(DWORD *)(p + 1) = (DWORD)fn - (at + 5);
+    VirtualProtect(p, 5, old, &old);
+}
+
 static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e. once the window exists
+    patch_call(0x64490d, h_device_setup);
+    if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_jmp(0x6a0d80, h_movie_open);
     patch_call(0x60e9c7, h_cursor_pass); // engine frame loop
     patch_call(0x60ea01, h_cursor_pass);
     patch_call(0x611f64, h_pick_hover);  // hover inside the cursor pass
@@ -617,6 +645,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res) {
     char env[MAX_PATH];
     if (GetEnvironmentVariableA("SACREDPAD_CTL", env, sizeof env))
         snprintf(ctl_path, sizeof ctl_path, "%s%s", env[0] == '/' ? "Z:" : "", env);
+    else if (GetFileAttributesA("sacredpad_ctl.txt") != INVALID_FILE_ATTRIBUTES) // test hook for Steam launches
+        strcpy(ctl_path, "sacredpad_ctl.txt");
     real_GetCursorPos = hook("user32.dll", "GetCursorPos", h_GetCursorPos);
     real_SetCursorPos = hook("user32.dll", "SetCursorPos", h_SetCursorPos);
     real_GetAsyncKeyState = hook("user32.dll", "GetAsyncKeyState", h_GetAsyncKeyState);
