@@ -53,27 +53,27 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - [x] 1.2 Pad source: XInput (real) or control file (test) → one pad state
 - [x] 1.3 Left stick → move (held LMB at hero + stick offset; picker patched so it never talks/attacks)
 - [x] 1.4 Buttons → game hotkeys (potions, slots, map, Esc, Alt labels)
-- [ ] 1.5 Panels: stick-driven virtual cursor, A/X = left/right click
+- [x] 1.5 Panels: stick-driven virtual cursor, A/X = left/right click
 
 ### Phase 2 — engine-aware gameplay (RE)
 - [x] 2.1 Hero world position + world→screen projection
 - [x] 2.2 Entity enumeration: type, hostility, alive, position
 - [x] 2.3 Auto-target: cone score, sticky, R3 lock, right-stick bias; aim + click
-- [ ] 2.4 Combat arts on buttons; LT page; ground arts tap / hold-to-aim
-- [ ] 2.5 Loot: LB-held item targeting, A picks up; gold auto
-- [ ] 2.6 Stand still, horse mount/dismount
+- [x] 2.4 Combat arts on buttons; LT page = weapon slots; ground arts: tap = target/ahead, right stick = manual aim (no reticle yet)
+- [x] 2.5 Loot: LB-held item targeting, A picks up, LB+A with nothing in reach = collect all
+- [x] 2.6 Stand still (L3); mount = A on the horse. Dismount button: not yet
 
 ### Phase 3 — controller UI
-- [ ] 3.1 Open-panel detection
-- [ ] 3.2 Grid snapping: inventory, equipment, chest, trader
-- [ ] 3.3 Dialog option navigation
-- [ ] 3.4 Xbox button-icon hints (minimal)
+- [x] 3.1 Open-panel detection
+- [x] 3.2 Grid snapping: inventory, equipment, chest, trader (32px cells + button jumps)
+- [x] 3.3 Dialog navigation (cursor warps to OK; D-pad between buttons)
+- [ ] 3.4 Xbox button-icon hints (not done)
 
 ### Phase 4 — ship
-- [ ] 4.1 install.sh / uninstall.sh for the Steam install
-- [ ] 4.2 One verification run via Steam/Proton (ws5)
-- [ ] 4.3 `sacredpad.ini`: deadzone, D2R-exact vs split preset
-- [ ] 4.4 README (incl. Steam Input: use the "Gamepad" template)
+- [x] 4.1 install.sh / uninstall.sh for the Steam install
+- [x] 4.2 Verified on the real install via Proton 11 (DRM exe, fullscreen): menus + pad input. Needed two Proton fixes
+- [ ] 4.3 `sacredpad.ini` (skipped until something needs tuning)
+- [x] 4.4 README (incl. Steam Input: use the "Gamepad" template)
 
 ## Findings
 - SteamStub Variant 2.0; Steamless unpacks it. `.text` is decrypted by the time `CreateWindowExA` runs, so code
@@ -87,5 +87,11 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - Camera is a fixed 2:1 isometric projection; measured each frame from three view picks.
 - Click semantics come from the game: forcing the picker's answer makes the stock click handler attack / talk /
   open / pick up and path there. Forcing the hover answer gives the game's own target highlight + enemy info bar.
+- Proton 11: the game picks a D3D device record whose GUID pointer is stack garbage (0x480); Proton's ddraw
+  dereferences it (EnumZBufferFormats, CreateDevice). Fixed at 0x645260's call site. Movies use amstream,
+  which crashes under Proton: the opener 0x6a0d80 is stubbed on Wine. Both happen without the mod too.
+- UI: cUI_Manager `*0x17eebbc`, windows at +0x80 (23 slots), dialogs [+0x124, +0x128); control: +0x10 flags
+  (bit 0 visible), +0x24/+0x28 pos (parent-relative), +0x2c/+0x2e size, +0x30 name, +0x50 parent,
+  +0x78/+0x7c children. NPC text dialog = cUI_Tooltip (vtable 0x896b3c) with OK drawn bottom centre.
 - Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
   Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.
