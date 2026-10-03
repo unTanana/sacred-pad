@@ -1,0 +1,8 @@
+tools/
+sandbox/
+prefix/
+re/ghidra-project/
+*.dll
+*.exe
+*.o
+logs/
