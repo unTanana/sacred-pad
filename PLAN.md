@@ -46,13 +46,13 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - [x] 0.2 Portable tools: llvm-mingw, Ghidra + JDK, wine-mono, Steamless
 - [x] 0.3 Unpack Sacred.exe with Steamless; start Ghidra auto-analysis (background)
 - [x] 0.4 Sandbox + prefix + launch/kill scripts; game reaches the menu on ws5 and keeps running unfocused
-- [ ] 0.5 Proxy DLL skeleton: forwards ijl15, logs, per-frame tick, control-file pad, screenshot on demand
+- [x] 0.5 Proxy DLL skeleton: forwards ijl15, logs, per-frame tick, control-file pad, screenshot on demand
 
 ### Phase 1 — virtual input layer (playable without RE)
-- [ ] 1.1 IAT hooks + synthetic messages; the game runs and accepts input while unfocused
-- [ ] 1.2 Pad source: XInput (real) or control file (test) → one pad state
-- [ ] 1.3 Left stick → move (held LMB at hero + stick offset)
-- [ ] 1.4 Buttons → game hotkeys (potions, slots, map, Esc, Alt labels)
+- [x] 1.1 IAT hooks + synthetic messages; the game runs and accepts input while unfocused
+- [x] 1.2 Pad source: XInput (real) or control file (test) → one pad state
+- [x] 1.3 Left stick → move (held LMB at hero + stick offset; picker patched so it never talks/attacks)
+- [x] 1.4 Buttons → game hotkeys (potions, slots, map, Esc, Alt labels)
 - [ ] 1.5 Panels: stick-driven virtual cursor, A/X = left/right click
 
 ### Phase 2 — engine-aware gameplay (RE)

@@ -104,7 +104,7 @@ static void key(int k, int down) {
     if (k == VK_LBUTTON) m = down ? WM_LBUTTONDOWN : WM_LBUTTONUP;
     else if (k == VK_RBUTTON) m = down ? WM_RBUTTONDOWN : WM_RBUTTONUP;
     if (m) { PostMessageA(game, m, mk(), MAKELPARAM(vcur.x, vcur.y)); return; }
-    if (k == VK_MENU || (k >= VK_LEFT && k <= VK_DOWN)) return; // polled via GetAsyncKeyState; Alt msgs would open the system menu
+    if (k == VK_MENU) return; // polled via GetAsyncKeyState; Alt messages would open the system menu
     LPARAM l = 1 | MapVirtualKeyA(k, 0) << 16 | (down ? 0 : 0xC0000000u);
     PostMessageA(game, down ? WM_KEYDOWN : WM_KEYUP, k, l);
 }
@@ -142,34 +142,86 @@ static BOOL WINAPI h_GetKeyboardState(PBYTE ks) {
 static HWND WINAPI h_GetForegroundWindow(void) { return game ? game : real_GetForegroundWindow(); }
 static HWND WINAPI h_GetFocus(void) { return game ? game : real_GetFocus(); }
 
-// ---------------------------------------------------------------- per-frame logic
-static void update(void) {
-    // Left stick -> the game's own keyboard walking (arrow keys, 8-way). ponytail: digital 8-way, analog move event later.
-    float a = atan2f(pad.ly, pad.lx), m = hypotf(pad.lx, pad.ly);
-    int dir = m > 0.3f ? ((int)lroundf(a / (float)(M_PI / 4)) + 8) % 8 : -1; // 0=E,1=NE,2=N...
-    key(VK_RIGHT, dir == 7 || dir == 0 || dir == 1);
-    key(VK_UP, dir >= 1 && dir <= 3);
-    key(VK_LEFT, dir >= 3 && dir <= 5);
-    key(VK_DOWN, dir >= 5 && dir <= 7);
+// ---------------------------------------------------------------- engine patches (Steam 2.0.2.28 addresses)
+// The world picker: which object is under a screen point. Returning 0 makes a left click a plain ground move.
+static int walk_only; // set while the left stick walks: no talking to / attacking whatever the cursor passes over
+static int (__fastcall *pick)(void *, void *, int, int, unsigned, void *) = (void *)0x626c50;
+static int __fastcall h_pick(void *view, void *edx, int x, int y, unsigned a, void *b) {
+    return walk_only ? 0 : pick(view, edx, x, y, a, b);
+}
 
-    // Right stick -> free cursor
+static void patch_call(DWORD at, void *fn) {
+    BYTE *p = (BYTE *)at;
+    DWORD old;
+    if (*p != 0xE8) { LOG("patch_call: no call at %08lx", at); return; }
+    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    *(DWORD *)(p + 1) = (DWORD)fn - (at + 5);
+    VirtualProtect(p, 5, old, &old);
+}
+
+static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e. once the window exists
+    patch_call(0x611f64, h_pick); // hover
+    patch_call(0x6174fb, h_pick); // left click
+    patch_call(0x618003, h_pick);
+}
+
+// ---------------------------------------------------------------- per-frame logic
+#define BTN_LT 0x0400 // spare XInput bits: triggers as buttons
+#define BTN_RT 0x0800
+enum { A = XINPUT_GAMEPAD_A, B = XINPUT_GAMEPAD_B, X = XINPUT_GAMEPAD_X, Y = XINPUT_GAMEPAD_Y,
+       LB = XINPUT_GAMEPAD_LEFT_SHOULDER, RB = XINPUT_GAMEPAD_RIGHT_SHOULDER, L3 = XINPUT_GAMEPAD_LEFT_THUMB };
+
+static POINT hero_screen(void) { return (POINT){512, 384}; } // ponytail: the camera keeps the hero's feet at the centre; projection in phase 2
+
+static void tap(int k) { key(k, 1), key(k, 0); }
+
+static void update(void) {
+    int lt = DOWN(BTN_LT);
+    static int walking, stand;
+
+    // Left stick: hold the left button on the ground ahead of the hero (the game's own click-and-hold walking).
+    float m = hypotf(pad.lx, pad.ly);
+    if (m > 0.2f) {
+        POINT h = hero_screen();
+        move_cursor(h.x + lroundf(pad.lx / m * 160), h.y - lroundf(pad.ly / m * 120));
+        key(VK_LBUTTON, 1), walking = 1;
+    } else if (walking) {
+        key(VK_LBUTTON, 0), walking = 0;
+    }
     if (pad.rx || pad.ry) move_cursor(vcur.x + lroundf(pad.rx * 14), vcur.y - lroundf(pad.ry * 14));
 
-    key(VK_LBUTTON, DOWN(XINPUT_GAMEPAD_A));
-    key(VK_RBUTTON, DOWN(XINPUT_GAMEPAD_X));
-    key(VK_ESCAPE, DOWN(XINPUT_GAMEPAD_START));
-    key('M', DOWN(XINPUT_GAMEPAD_BACK));
-    key(VK_MENU, DOWN(XINPUT_GAMEPAD_LEFT_SHOULDER));
-    key(VK_CONTROL, DOWN(XINPUT_GAMEPAD_LEFT_THUMB));
+    // A: left click at the cursor (attack / talk / open / pick up). LB+A: collect everything.
+    if (!walking) key(VK_LBUTTON, DOWN(A) && !DOWN(LB));
+    if (DOWN(LB) && PRESSED(A)) tap('A');
+
+    // X Y B RB RT: select combat-art slot 6..0 and hold the right button to use it; with LT: weapon slot 1..5.
+    static const WORD slot_btn[] = {X, Y, B, RB, BTN_RT};
+    int using = 0;
+    for (int i = 0; i < 5; i++) {
+        if (PRESSED(slot_btn[i])) tap(lt ? '1' + i : "67890"[i]);
+        using |= DOWN(slot_btn[i]);
+    }
+    key(VK_RBUTTON, using && !lt);
+    walk_only = walking && !DOWN(A) && !using;
+
+    // D-pad: potions (heal, undead death, antidote, concentration; LT+up: mentor).
+    if (PRESSED(XINPUT_GAMEPAD_DPAD_UP)) tap(lt ? 'W' : VK_SPACE);
+    if (PRESSED(XINPUT_GAMEPAD_DPAD_RIGHT)) tap('Q');
+    if (PRESSED(XINPUT_GAMEPAD_DPAD_LEFT)) tap('E');
+    if (PRESSED(XINPUT_GAMEPAD_DPAD_DOWN)) tap('R');
+
+    if (PRESSED(XINPUT_GAMEPAD_START)) tap(lt ? 'L' : VK_ESCAPE);
+    if (PRESSED(XINPUT_GAMEPAD_BACK)) tap(lt ? 'M' : 'I');
+    key(VK_MENU, DOWN(LB)); // show names
+    if (PRESSED(L3)) stand = !stand;
+    key(VK_CONTROL, stand); // Ctrl: stop and attack instead of walking
 }
 
 static void tick(void) {
-    static DWORD last;
-    DWORD now = GetTickCount();
-    if (now - last < 8) return;
-    last = now;
     prev = pad;
     read_pad();
+    if (pad.lt > 0.5f) pad.btn |= BTN_LT;
+    if (pad.rt > 0.5f) pad.btn |= BTN_RT;
     if (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) pad_mode = 1;
     if (ctl_cx >= 0) pad_mode = 1, move_cursor(ctl_cx, ctl_cy);
     if (!pad_mode) return;
@@ -177,10 +229,11 @@ static void tick(void) {
     if (pad.btn != prev.btn) LOG("pad btn=%04x cur=%ld,%ld", pad.btn, vcur.x, vcur.y);
 }
 
-#define TICK_TIMER 0x5ad
+static DWORD WINAPI tick_thread(LPVOID unused) {
+    for (;;) Sleep(8), tick(); // own thread: the game's queue is too busy for WM_TIMER to be delivered in-world
+}
 
 static LRESULT CALLBACK game_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_TIMER && w == TICK_TIMER) return tick(), 0; // the main thread only pumps messages; drive our tick from it
     // Keep running and accepting input while unfocused (alt-tab, or a hidden workspace while testing).
     if ((m == WM_ACTIVATEAPP && !w) || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) || m == WM_KILLFOCUS) return 0;
     if (m == WM_MOUSEMOVE && pad_mode && !*ctl_path && (GET_X_LPARAM(l) != vcur.x || GET_Y_LPARAM(l) != vcur.y))
@@ -194,8 +247,9 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD st
     LOG("CreateWindowExA cls=%s name=%s style=%08lx -> %p", HIWORD(cls) ? cls : "#", name ? name : "", style, r);
     if (r && !parent && !game) {
         game = r;
+        patch_engine();
         game_proc = (WNDPROC)SetWindowLongA(r, GWL_WNDPROC, (LONG)game_wndproc);
-        SetTimer(r, TICK_TIMER, 10, NULL);
+        CreateThread(NULL, 0, tick_thread, NULL, 0, NULL);
     }
     return r;
 }
