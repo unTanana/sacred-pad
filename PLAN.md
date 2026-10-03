@@ -56,9 +56,9 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - [ ] 1.5 Panels: stick-driven virtual cursor, A/X = left/right click
 
 ### Phase 2 — engine-aware gameplay (RE)
-- [ ] 2.1 Hero world position + world→screen projection
-- [ ] 2.2 Entity enumeration: type, hostility, alive, position
-- [ ] 2.3 Auto-target: cone score, sticky, R3 lock, right-stick bias; aim + click
+- [x] 2.1 Hero world position + world→screen projection
+- [x] 2.2 Entity enumeration: type, hostility, alive, position
+- [x] 2.3 Auto-target: cone score, sticky, R3 lock, right-stick bias; aim + click
 - [ ] 2.4 Combat arts on buttons; LT page; ground arts tap / hold-to-aim
 - [ ] 2.5 Loot: LB-held item targeting, A picks up; gold auto
 - [ ] 2.6 Stand still, horse mount/dismount
@@ -76,4 +76,16 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - [ ] 4.4 README (incl. Steam Input: use the "Gamepad" template)
 
 ## Findings
-(filled in as work progresses)
+- SteamStub Variant 2.0; Steamless unpacks it. `.text` is decrypted by the time `CreateWindowExA` runs, so code
+  patches go there (not DllMain).
+- The main thread only pumps messages and the world swaps in its own WndProc (via a delay-loaded SetWindowLongA),
+  so the DLL ticks on its own thread; engine-side work runs from the frame loop's cursor pass (`0x611e70` call sites).
+- Engine (Steam 2.0.2.28): object manager `*0xad5c40` (+4/+8 ref table), game state `*0x182ebe8` (+0x14 hero ref),
+  type table `*0xaab5e4` (0x80/record, +0x2e family), picker `0x626c50` (thiscall view), view screen->ground =
+  vtable +0x18, can-attack `0x548f60` (thiscall hero, creature), has-dialog `0x549920`, item-type `0x427920`.
+- Object: +0xC ref, +0x10 type, +0x18 sector (0 = carried), +0x1C/+0x20 world x/y; creature HP +0x4D8.
+- Camera is a fixed 2:1 isometric projection; measured each frame from three view picks.
+- Click semantics come from the game: forcing the picker's answer makes the stock click handler attack / talk /
+  open / pick up and path there. Forcing the hover answer gives the game's own target highlight + enemy info bar.
+- Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
+  Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.
