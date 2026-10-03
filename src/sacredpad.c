@@ -20,6 +20,7 @@ static int ctl_cx = -1, ctl_cy = -1; // test mode: CX=/CY= put the cursor at an 
 static volatile int ctl_dump;          // test mode: DUMP logs the classified objects around the hero
 static volatile int ctl_far;           // test mode: FAR lifts the target radius / on-screen limit
 static volatile int ctl_key;           // test mode: KEY=<vk> taps a key once
+static volatile int ctl_uidump;        // test mode: UIDUMP logs the visible UI tree
 static volatile unsigned target, locked; // soft target; R3 lock
 
 static const struct { const char *name; WORD bit; } btn_names[] = {
@@ -57,6 +58,7 @@ static void read_pad(void) {
                 if (!strcmp(t, btn_names[i].name)) pad.btn |= btn_names[i].bit;
             if (!strcmp(t, "DUMP")) ctl_dump = 1;
             if (!strcmp(t, "FAR")) ctl_far = 1;
+            if (!strcmp(t, "UIDUMP")) ctl_uidump = 1;
         }
         if (f) fclose(f);
         return;
@@ -206,6 +208,23 @@ static POINT to_screen(int x, int y) {
     return (POINT){512 + lroundf(Ji[0] * dx + Ji[1] * dy), 384 + lroundf(Ji[2] * dx + Ji[3] * dy)};
 }
 
+// ---------------------------------------------------------------- UI (cUI_Manager and its windows)
+#define UIMGR (*(BYTE **)0x17eebbc) // +0x80..+0xd8: one window pointer per UI_WND_*
+typedef struct Ctl { void **vt; int _4, _8, _c, flags, _14[4]; int x, y; short w, h; char name[32]; struct Ctl *parent;
+                     BYTE _54[0x24]; struct Ctl **kids, **kids_end; } Ctl; // cUI_Control2 / cUI_Window2 prefix
+static POINT ctl_pos(Ctl *c) { // absolute: x/y are relative to the parent
+    POINT p = {0, 0};
+    for (int i = 0; c && i < 16; c = c->parent, i++) p.x += c->x, p.y += c->y;
+    return p;
+}
+static void ui_dump(Ctl *c, int depth) {
+    if (!c || !(c->flags & 1) || depth > 6) return;
+    POINT p = ctl_pos(c);
+    LOG("ui %*s%.32s vt=%p at %ld,%ld %dx%d flags=%x", depth * 2, "", c->name, (void *)c->vt, p.x, p.y, c->w, c->h, c->flags);
+    if (c->kids && c->kids_end > c->kids && c->kids_end - c->kids < 512)
+        for (Ctl **k = c->kids; k < c->kids_end; k++) ui_dump(*k, depth + 1);
+}
+
 // ---------------------------------------------------------------- targeting (runs on the engine thread, per frame)
 static volatile int target_kind;
 static volatile POINT target_pos, hero_pos = {512, 384};
@@ -247,6 +266,15 @@ static void update_targets(void *view) {
         if (score < best) best = score, best_ref = r, best_pos = s, target_kind = k;
     }
     if (locked && best_ref != locked) locked = 0; // lock lost (dead, gone, off screen)
+    if (ctl_uidump && UIMGR) {
+        ctl_uidump = 0;
+        for (int i = 0; i < 23; i++) ui_dump(((Ctl **)(UIMGR + 0x80))[i], 0);
+        for (int i = 0; i < 23; i++) {
+            Ctl *w = ((Ctl **)(UIMGR + 0x80))[i];
+            LOG("uiw %d %.32s vt=%p vis=%d", i, w ? w->name : "-", w ? (void *)w->vt : 0, w ? w->flags & 1 : 0);
+        }
+        for (Ctl **w = *(Ctl ***)(UIMGR + 0x124); w && w < *(Ctl ***)(UIMGR + 0x128); w++) ui_dump(*w, 0);
+    }
     if (ctl_dump) {
         ctl_dump = 0;
         LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked);
@@ -262,11 +290,54 @@ static void update_targets(void *view) {
     target = best_ref, target_pos = best_pos;
 }
 
+// Snapshot of the open panels/dialogs, taken on the engine thread (the input thread never walks UI pointers).
+static struct { volatile int open, nwin, nbtn; RECT win[24]; int grid[24]; POINT btn[64]; volatile void *dlg; POINT ok; } ui;
+static void collect_buttons(Ctl *c, int depth) {
+    if (!c || !(c->flags & 1) || depth > 6) return;
+    if ((c->vt == (void **)0x897308 || c->vt == (void **)0x89733c) && ui.nbtn < 64) { // cUI_Button2 / RadioButton2
+        POINT p = ctl_pos(c);
+        ui.btn[ui.nbtn++] = (POINT){p.x + c->w / 2, p.y + c->h / 2};
+    }
+    if (c->kids && c->kids_end > c->kids && c->kids_end - c->kids < 512)
+        for (Ctl **k = c->kids; k < c->kids_end; k++) collect_buttons(*k, depth + 1);
+}
+static void add_window(Ctl *w, int grid) {
+    if (!w || !(w->flags & 1) || ui.nwin >= 24) return;
+    POINT p = ctl_pos(w);
+    ui.grid[ui.nwin] = grid;
+    ui.win[ui.nwin++] = (RECT){p.x, p.y, p.x + w->w, p.y + w->h};
+    collect_buttons(w, 0);
+}
+static void snapshot_ui(void) {
+    BYTE *m = UIMGR;
+    int nwin = 0, nbtn = 0;
+    ui.nwin = ui.nbtn = 0;
+    if (m) {
+        Ctl **w = (Ctl **)(m + 0x80);
+        for (int i = 0; i < 23; i++) // not the taskbar (0), party portraits (7) or slot 19: they are always up
+            if (i != 0 && i != 7 && i != 19)
+                add_window(w[i], i == 1 || i == 2 || i == 3 || i == 4 || i == 13 || i == 16 || i == 21 || i == 22);
+        void *dlg = 0;
+        for (Ctl **d = *(Ctl ***)(m + 0x124); d && d < *(Ctl ***)(m + 0x128); d++) { // dialogs
+            add_window(*d, 0);
+            if (*d && ((*d)->flags & 1) && (*d)->vt == (void **)0x896b3c) { // NPC text: OK is drawn bottom centre
+                POINT p = ctl_pos(*d);
+                ui.ok = (POINT){p.x + (*d)->w / 2, p.y + (*d)->h - 19}, dlg = *d;
+            }
+        }
+        ui.dlg = dlg;
+        nwin = ui.nwin, nbtn = ui.nbtn;
+    }
+    ui.open = nwin > 0;
+    (void)nbtn;
+}
+
 // The engine's per-frame cursor pass (engine thread). Targeting runs here, before the pass skips its pick
 // because the cursor is over the HUD.
 static int (__fastcall *cursor_pass)(void *, void *, int, int) = (void *)0x611e70;
 static int __fastcall h_cursor_pass(void *engine, void *edx, int a, int b) {
     BYTE *e = engine;
+    snapshot_ui();
     update_targets(*(void **)(e + 8 + 4 * *(WORD *)(e + 0x48))); // the current cWorldView
     return cursor_pass(engine, edx, a, b);
 }
@@ -324,9 +395,93 @@ static void aim_action(void) {
     else force = 0, cursor_toward((POINT){hero_pos.x + lroundf(aim_x * 180), hero_pos.y + lroundf(aim_y * 135)});
 }
 
+static int walking, stand, acting;
+
+// D-pad in menus: jump to the nearest button that way; inside item grids (or with no button that way) step one
+// 32-pixel cell, snapped to the grid of the window under the cursor.
+static void menu_step(int dx, int dy) {
+    int gi = -1;
+    for (int i = 0; i < ui.nwin; i++)
+        if (ui.grid[i] && PtInRect(&ui.win[i], vcur)) gi = i;
+    if (gi < 0) {
+        float best = 1e9f;
+        POINT to = {-1, -1};
+        for (int i = 0; i < ui.nbtn; i++) {
+            float bx = ui.btn[i].x - vcur.x, by = ui.btn[i].y - vcur.y, along = bx * dx + by * dy;
+            float across = fabsf(bx * dy - by * dx);
+            if (along < 8 || across > along * 1.5f) continue; // roughly that way
+            if (along + 2 * across < best) best = along + 2 * across, to = ui.btn[i];
+        }
+        if (to.x >= 0) { move_cursor(to.x, to.y); return; }
+    }
+    POINT p = {vcur.x + dx * 32, vcur.y + dy * 32};
+    for (int i = 0; i < ui.nwin; i++)
+        if (ui.grid[i] && PtInRect(&ui.win[i], p)) {
+            p.x = ui.win[i].left + 16 + (p.x - ui.win[i].left) / 32 * 32;
+            p.y = ui.win[i].top + 16 + (p.y - ui.win[i].top) / 32 * 32;
+        }
+    move_cursor(p.x, p.y);
+}
+
+// Panels, dialogs and the menus: the sticks drive the cursor, the D-pad snaps, A/X click.
+static void update_menu(int entered) {
+    static float fx, fy;
+    static int repeat, tab;
+    static volatile void *last_dlg;
+    if (ui.dlg != last_dlg && (last_dlg = ui.dlg)) { // a dialog appeared: on its OK
+        LOG("warp dialog ok %ld,%ld", ui.ok.x, ui.ok.y);
+        move_cursor(ui.ok.x, ui.ok.y);
+    }
+    else if (entered && hero()) { // a panel just opened: start on its first button, or its middle
+        if (ui.nbtn) move_cursor(ui.btn[0].x, ui.btn[0].y);
+        else if (ui.nwin) move_cursor((ui.win[0].left + ui.win[0].right) / 2, (ui.win[0].top + ui.win[0].bottom) / 2);
+    }
+    float lx = pad.lx + pad.rx, ly = pad.ly + pad.ry, m = fminf(hypotf(lx, ly), 1);
+    if (m > 0) {
+        if (!fx && !fy) fx = vcur.x, fy = vcur.y;
+        fx += lx * (1.5f + 10 * m), fy -= ly * (1.5f + 10 * m); // slow near the centre for precise aiming
+        move_cursor(lroundf(fx), lroundf(fy));
+    }
+    fx = vcur.x, fy = vcur.y;
+
+    static const WORD dirs[] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
+    static const int ddx[] = {0, 0, -1, 1}, ddy[] = {-1, 1, 0, 0};
+    for (int i = 0; i < 4; i++)
+        if (PRESSED(dirs[i]) || (DOWN(dirs[i]) && --repeat == 0)) {
+            menu_step(ddx[i], ddy[i]);
+            repeat = PRESSED(dirs[i]) ? 30 : 12; // auto-repeat after 240 ms, then every 96 ms
+        }
+
+    key(VK_LBUTTON, DOWN(A));
+    key(VK_RBUTTON, DOWN(X)); // equip / use
+    if (PRESSED(B) || PRESSED(XINPUT_GAMEPAD_START)) tap(VK_ESCAPE);
+    if (PRESSED(XINPUT_GAMEPAD_BACK)) tap('I');
+    if (PRESSED(LB) || PRESSED(RB)) { // inventory tabs: backpack, combat arts, combo
+        static const POINT tabs[] = {{73, 362}, {229, 362}, {391, 362}};
+        tab = (tab + (PRESSED(RB) ? 1 : 2)) % 3;
+        POINT back = vcur;
+        move_cursor(tabs[tab].x, tabs[tab].y), key(VK_LBUTTON, 1), key(VK_LBUTTON, 0), move_cursor(back.x, back.y);
+    }
+}
+
 static void update(void) {
     int lt = DOWN(BTN_LT);
-    static int walking, stand, acting;
+    static int was_menu;
+    int menu = !hero() || ui.open;
+    static WORD swallow; // buttons held across a world/menu switch do nothing until released
+    if (menu != was_menu) { // hand over cleanly between world and menu controls
+        key(VK_LBUTTON, 0), key(VK_RBUTTON, 0), key(VK_MENU, 0), key(VK_CONTROL, 0);
+        walking = acting = 0, walk_only = 0, force = -1, holding = 0;
+        swallow = pad.btn & prev.btn;
+    }
+    swallow &= pad.btn;
+    pad.btn &= ~swallow;
+    if (menu) {
+        cursor_mode = 1, cursor_idle = 0;
+        update_menu(!was_menu), was_menu = 1;
+        return;
+    }
+    was_menu = 0;
 
     float m = hypotf(pad.lx, pad.ly);
     if (m > 0.2f) aim_x = pad.lx / m, aim_y = -pad.ly / m, cursor_mode = 0;
@@ -399,6 +554,8 @@ static void tick(void) {
     if (pad.rt > 0.5f) pad.btn |= BTN_RT;
     if (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) pad_mode = 1;
     if (ctl_cx >= 0) pad_mode = 1, cursor_mode = 1, cursor_idle = 0, move_cursor(ctl_cx, ctl_cy);
+    static int last_open = -1;
+    if (ui.open != last_open) LOG("ui open=%d windows=%d buttons=%d", ui.open, ui.nwin, ui.nbtn), last_open = ui.open;
     if (!pad_mode) return;
     update();
     static int last_key;
