@@ -6,3 +6,5 @@ re/ghidra-project/
 *.exe
 *.o
 logs/
+re/sacred.c
+re/sacred.asm

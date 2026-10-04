@@ -115,7 +115,9 @@ The mouse keeps working: moving it hands the cursor back until you touch the pad
 ## Development
 
 `PLAN.md` has the task list and the reverse-engineering findings (addresses are for the Steam
-2.0.2.28 exe). `./build.sh` builds with llvm-mingw from `tools/`. The `test/` scripts run a sandboxed,
+2.0.2.28 exe). The game's own code isn't in this repo: `re/scripts` export your Ghidra analysis of the
+Steamless-unpacked exe (`ExportC.java` writes the decompiled C, the others the class hierarchy / `re/vtables.txt`).
+`./build.sh` builds with llvm-mingw from `tools/`. The `test/` scripts run a sandboxed,
 DRM-free copy on Hyprland workspace 5 (`test/start.sh new|load|daemon`; `PROTON=1` for Proton, `REAL=1` for
 the real install) and drive it through a control file (`SACREDPAD_CTL`, or
 `sacredpad_ctl.txt` in the game folder) with tokens like `LX=1 A`, `CX=512 CY=288 A`, `LOCK=<ref>`, `FAR`, `DUMP`, `FOCUS` (focus list),
