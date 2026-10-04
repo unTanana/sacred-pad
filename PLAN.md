@@ -122,5 +122,7 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
   (has_dialog is 0 for them). The game swaps window procedures through a delay-loaded SetWindowLongA pointer
   (0xa23fb4): redirected so the mod's procedure stays first. The pad's own mouse messages carry MK 0x8000
   (stripped before the game), so late-arriving ones are never mistaken for the real mouse.
+- Hotbar art slots: slot i centred at (670 + 67 i, 716). Assigning = the game's drag and drop: click the art,
+  move, click the slot. The game needs to see the cursor arrive on the slot before the drop click (~50 ms).
 - Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
   Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.

@@ -63,6 +63,11 @@ static volatile unsigned mount_ref;         // the horse the hero rides (hero +0
 static volatile int hero_level;             // hero +0x3fe: decides how many HUD slots are unlocked
 static volatile int aiming;                 // an art button is held and the right stick places a ground marker
 static volatile POINT reticle;
+// Hotbar art slots (1024x768 HUD): slot i (keys 6..0, pad X Y B RB RT) is centred at (670 + 67 i, 716);
+// one slot at level 1, another at levels 2, 8, 16 and 30.
+static POINT art_slot(int i) { return (POINT){670 + 67 * i, 716}; }
+static int art_slots(void) { int l = hero_level; return 1 + (l >= 2) + (l >= 8) + (l >= 16) + (l >= 30); }
+static volatile int assigning; // X on a combat art: the next X/Y/B/RB/RT puts it on that slot, A cancels
 
 static const struct { const char *name; WORD bit; } btn_names[] = {
     {"UP", XINPUT_GAMEPAD_DPAD_UP}, {"DOWN", XINPUT_GAMEPAD_DPAD_DOWN}, {"LEFT", XINPUT_GAMEPAD_DPAD_LEFT},
@@ -398,7 +403,7 @@ static void update_targets(void *view) {
 // list is exactly what is on screen: hidden pages, tabs and closed windows never draw. Item grids come from the
 // inventory data. The list is built on the render thread and published at each present.
 typedef struct { RECT r; int kind; } Focus;
-enum { F_CTL, F_ITEM, F_SLOT, F_CELL };
+enum { F_CTL, F_ITEM, F_SLOT, F_CELL, F_ART }; // F_ART: a combat art or combo that can go on the hotbar
 #define MAXF 256
 static Focus fbuf[2][MAXF];
 static volatile int fpub, fcount[2]; // fbuf[fpub] is the published list, fbuf[!fpub] is being built
@@ -443,13 +448,15 @@ static void __fastcall h_render(Ctl *c, void *edx, void *dev) {
 // header row 26 px above the sheet; tabs are centred at +73, +229, +391. ponytail: three tabs assumed, read the
 // tab count from the sheet if a screen with fewer/more ever turns up.
 static volatile RECT sheets[4];
-static volatile int nsheets;
+static volatile int nsheets, sheet_tab[4]; // sheet_tab: the tab shown (tab control at +0x78, index at +0x84)
 static RECT pub_sheets[4];
-static volatile int pub_nsheets;
+static volatile int pub_nsheets, pub_sheet_tab[4];
 static void (__fastcall *sheet_render)(void *, void *, void *) = (void *)0x7297f0;
 static void __fastcall h_sheet_render(Ctl *c, void *edx, void *dev) {
     if ((c->flags & 1) && nsheets < 4) {
         POINT p = ctl_pos(c);
+        BYTE *tc = *(BYTE **)((BYTE *)c + 0x78);
+        sheet_tab[nsheets] = tc && !IsBadReadPtr(tc + 0x84, 2) ? *(WORD *)(tc + 0x84) % 3 : 0;
         sheets[nsheets++] = (RECT){p.x, p.y - 26, p.x + c->w, p.y + c->h};
         static const int tab_x[] = {73, 229, 391};
         for (int i = 0; i < 3; i++) add_focus((RECT){p.x + tab_x[i] - 70, p.y - 38, p.x + tab_x[i] + 70, p.y - 14}, F_CTL);
@@ -464,7 +471,7 @@ static void __fastcall h_spell_render(Ctl *c, void *edx, void *dev) {
     BYTE *b = *(BYTE **)((BYTE *)c + 0x2cc), *e = *(BYTE **)((BYTE *)c + 0x2d0);
     if ((c->flags & 1) && b && e > b && e - b <= 64 * 16 && !IsBadReadPtr(b, e - b))
         for (; b < e; b += 16)
-            if (*b & 1) add_focus((RECT){*(short *)(b + 4), *(short *)(b + 6), *(short *)(b + 4) + 64, *(short *)(b + 6) + 64}, F_SLOT);
+            if (*b & 1) add_focus((RECT){*(short *)(b + 4), *(short *)(b + 6), *(short *)(b + 4) + 64, *(short *)(b + 6) + 64}, F_ART);
     spell_render(c, edx, dev);
 }
 static void (__fastcall *combo_render)(void *, void *, void *) = (void *)0x6bf6f0;
@@ -473,7 +480,7 @@ static void __fastcall h_combo_render(Ctl *c, void *edx, void *dev) {
         for (Ctl **k = (Ctl **)((BYTE *)c + 0x154); k <= (Ctl **)((BYTE *)c + 0x160); k++)
             if (ctl_ok(*k)) {
                 POINT p = ctl_pos(*k);
-                add_focus((RECT){p.x, p.y, p.x + (*k)->w, p.y + (*k)->h}, F_SLOT);
+                add_focus((RECT){p.x, p.y, p.x + (*k)->w, p.y + (*k)->h}, F_ART);
             }
     combo_render(c, edx, dev);
 }
@@ -571,7 +578,7 @@ static void snapshot_ui(void) {
     fmodal[nb] = modal;
     ui.open = open;
     int w = !fpub;
-    for (int i = 0; i < nsheets; i++) pub_sheets[i] = sheets[i];
+    for (int i = 0; i < nsheets; i++) pub_sheets[i] = sheets[i], pub_sheet_tab[i] = sheet_tab[i];
     pub_nsheets = nsheets;
     fpub = w, fcount[!w] = 0, ngrids = 0, nsheets = 0; // publish; start the next list
 }
@@ -629,7 +636,7 @@ static void patch_jmp(DWORD at, void *fn) {
 // Glyphs are painted once with GDI into small colour-keyed DirectDraw surfaces, then blitted onto the back
 // buffer right before the game flips (cDxDriver7 0x645e40: +0xb4 IDirectDraw7, +0xbc back buffer).
 enum { G_A, G_B, G_X, G_Y, G_LB, G_RB, G_LT, G_RT, G_UP, G_DOWN, G_LEFT, G_RIGHT, G_RING, G_LOCK,
-       G_MENU_LEGEND, G_MAIN_LEGEND, G_N };
+       G_MENU_LEGEND, G_MAIN_LEGEND, G_ASSIGN_LEGEND, G_N };
 static IDirectDrawSurface7 *glyph[G_N], *glyph_back;
 static SIZE gsize[G_N];
 
@@ -684,6 +691,8 @@ static int legend_width(HDC dc, const int *gl, const char *const *txt, int n, in
 // Legends: in-world panels, and the main menu.
 static const int menu_g[] = {G_A, G_X, G_B, G_LB}, main_g[] = {G_A, G_X, G_B};
 static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"}, *const main_t[] = {"Select", "Use", "Back"};
+static const int assign_g[] = {G_X, G_A};
+static const char *const assign_t[] = {"Y  B  RB  RT: put this art on that button", "Cancel"};
 
 static void paint_glyph(HDC dc, int g, int w, int h) {
     if (g == G_RING || g == G_LOCK) {
@@ -695,6 +704,7 @@ static void paint_glyph(HDC dc, int g, int w, int h) {
         SelectObject(dc, op), SelectObject(dc, ob), DeleteObject(pen);
     } else if (g == G_MENU_LEGEND) legend_width(dc, menu_g, menu_t, 4, 1);
     else if (g == G_MAIN_LEGEND) legend_width(dc, main_g, main_t, 3, 1);
+    else if (g == G_ASSIGN_LEGEND) legend_width(dc, assign_g, assign_t, 2, 1);
     else paint_button(dc, 0, 0, g);
 }
 
@@ -711,7 +721,8 @@ static int make_glyphs(IDirectDraw7 *dd, IDirectDrawSurface7 *back) {
         SIZE sz = g < G_LB ? (SIZE){24, 24} : g < G_UP ? (SIZE){30, 22} : g < G_RING ? (SIZE){22, 22}
                 : g <= G_LOCK ? (SIZE){g == G_RING ? 64 : 52, g == G_RING ? 64 : 52} : (SIZE){0, 30};
         if (!sz.cx) // legends: measure the text first
-            sz.cx = g == G_MENU_LEGEND ? legend_width(sdc, menu_g, menu_t, 4, 0) : legend_width(sdc, main_g, main_t, 3, 0);
+            sz.cx = g == G_MENU_LEGEND ? legend_width(sdc, menu_g, menu_t, 4, 0)
+                  : g == G_MAIN_LEGEND ? legend_width(sdc, main_g, main_t, 3, 0) : legend_width(sdc, assign_g, assign_t, 2, 0);
         DDSURFACEDESC2 d = {sizeof d};
         d.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
         d.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_VIDEOMEMORY; // GPU blits: system memory costs ~2 ms/frame on wined3d
@@ -783,7 +794,7 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     if (pad_mode && !world && !free_cursor && !IsRectEmpty(&focus)) frame(back, focus);
     if (cfg.hints && pad_mode) {
         if (world) {
-            int lvl = hero_level, n = 1 + (lvl >= 2) + (lvl >= 8) + (lvl >= 16) + (lvl >= 30);
+            int n = art_slots();
             static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT};
             for (int i = 0; i < n; i++) put(back, art_g[i], lt ? 362 - (n - 1 - i) * 67 : 670 + i * 67, 690);
             put(back, G_LT, 362 - n * 67 + 12, 712);
@@ -793,6 +804,10 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
                 put(back, G_A, target_pos.x, target_pos.y - above);
             }
             if (locked && target == locked) put(back, G_LOCK, target_pos.x, target_pos.y);
+        } else if (assigning) { // which button gets the art: the slots' buttons, and the prompt
+            static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT};
+            for (int i = 0, n = art_slots(); i < n; i++) put(back, art_g[i], art_slot(i).x, 690);
+            put(back, G_ASSIGN_LEGEND, 12 + gsize[G_ASSIGN_LEGEND].cx / 2, 20);
         } else {
             int g = in_world ? G_MENU_LEGEND : G_MAIN_LEGEND;
             put(back, g, 12 + gsize[g].cx / 2, in_world ? 20 : 748);
@@ -895,9 +910,26 @@ static int step_focus(Focus *f, int n, int dx, int dy) {
 
 static int release; // ticks until a scripted click is released
 
+// Scripted clicks for multi-step UI actions (drag and drop): each click moves the cursor, waits, presses, releases.
+static POINT clicks[4];
+static int nclicks, click_step;
+static void queue_click(int x, int y) { if (nclicks < 4) clicks[nclicks++] = (POINT){x, y}; }
+static int run_clicks(void) { // 1 while busy
+    if (!nclicks) return 0;
+    int k = click_step / 24, t = click_step % 24; // ~190 ms per click: the game must see the cursor arrive first
+    if (t == 0) move_cursor(clicks[k].x - 1, clicks[k].y);
+    if (t == 6) move_cursor(clicks[k].x, clicks[k].y);
+    if (t == 12) key(VK_LBUTTON, 1);
+    if (t == 16) key(VK_LBUTTON, 0);
+    if (++click_step >= nclicks * 24) nclicks = click_step = 0;
+    return 1;
+}
+
+
 static void update_menu(void) {
     static Focus f[MAXF];
-    static int repeat, tab, was_modal;
+    static int repeat, was_modal;
+    if (run_clicks()) return; // a scripted drag owns the cursor until it is done
     int n = focus_list(f), modal = fmodal[fpub];
     if (modal != was_modal) SetRectEmpty(&focus), was_modal = modal; // a pop-up opened or closed: start afresh
 
@@ -956,24 +988,36 @@ static void update_menu(void) {
         for (int i = 0; i < n; i++) LOG("focus  %d kind=%d %ld,%ld-%ld,%ld", i, f[i].kind, f[i].r.left, f[i].r.top, f[i].r.right, f[i].r.bottom);
     }
 
+    int focus_kind = cur >= 0 ? f[cur].kind : -1;
+    if (assigning) { // pick the slot for the art under the focus
+        static const WORD slot_btn[] = {X, Y, B, RB, BTN_RT};
+        for (int i = 0; i < 5; i++)
+            if (PRESSED(slot_btn[i]) && i < art_slots()) {
+                POINT a = centre(focus), s = art_slot(i);
+                queue_click(a.x, a.y), queue_click(s.x, s.y); // pick the art up, drop it on the slot
+                assigning = 0;
+            }
+        if (PRESSED(A) || PRESSED(XINPUT_GAMEPAD_START) || PRESSED(XINPUT_GAMEPAD_BACK) || PRESSED(LB)) assigning = 0;
+        return;
+    }
+    if (PRESSED(X) && focus_kind == F_ART) { assigning = 1; return; }
+
     if (!release) key(VK_LBUTTON, DOWN(A));
-    key(VK_RBUTTON, DOWN(X)); // equip / use
+    if (focus_kind != F_ART) key(VK_RBUTTON, DOWN(X)); // equip / use
     if (PRESSED(B) || PRESSED(XINPUT_GAMEPAD_START)) tap(VK_ESCAPE);
     if (PRESSED(XINPUT_GAMEPAD_BACK)) tap('I');
     // LB/RB: focus the previous/next tab of the sheet holding the focus and click it (released next tick, so the
     // game sees the click where the cursor is).
     if (release && !--release) key(VK_LBUTTON, 0);
     if ((PRESSED(LB) || PRESSED(RB)) && pub_nsheets) {
-        static int tabs[4];
         POINT c = centre(focus);
         int k = 0;
         for (int i = 0; i < pub_nsheets; i++) if (PtInRect(&pub_sheets[i], c)) k = i;
-        tabs[k] = (tabs[k] + (PRESSED(RB) ? 1 : 2)) % 3;
-        int x = pub_sheets[k].left + (int[]){73, 229, 391}[tabs[k]], y = pub_sheets[k].top; // header centre
+        int t = (pub_sheet_tab[k] + (PRESSED(RB) ? 1 : 2)) % 3;
+        int x = pub_sheets[k].left + (int[]){73, 229, 391}[t], y = pub_sheets[k].top; // header centre
         focus = (RECT){x - 70, y - 12, x + 70, y + 12}, free_cursor = 0;
         move_cursor(x, y), key(VK_LBUTTON, 1), release = 2;
     }
-    (void)tab;
 }
 
 static void update(void) {
@@ -990,7 +1034,7 @@ static void update(void) {
     pad.btn &= ~swallow;
     if (menu) {
         cursor_mode = 1, cursor_idle = 0;
-        if (!was_menu) SetRectEmpty(&focus), free_cursor = ctl_cx >= 0; // (a test-placed cursor stays free)
+        if (!was_menu) SetRectEmpty(&focus), free_cursor = ctl_cx >= 0, assigning = 0; // (a test-placed cursor stays free)
         update_menu(), was_menu = 1;
         return;
     }
