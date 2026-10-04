@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <ddraw.h>
 #include <xinput.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -110,11 +111,11 @@ static void read_pad(void) {
         float v;
         ctl_cx = ctl_cy = -1, ctl_far = 0;
         while (f && fscanf(f, "%31s", t) == 1) {
-            if (sscanf(t, "%7[A-Z]=%f", k, &v) == 2) {
+            if (sscanf(t, "%7[A-Z]=%f", k, &v) == 2 && fabsf(v) < 1e9f) { // (in range for the int conversions below)
                 float *ax[] = {&pad.lx, &pad.ly, &pad.rx, &pad.ry, &pad.lt, &pad.rt};
                 const char *an[] = {"LX", "LY", "RX", "RY", "LT", "RT"};
                 for (int i = 0; i < 6; i++) if (!strcmp(k, an[i])) *ax[i] = v;
-                if (!strcmp(k, "LOCK")) locked = v; // test mode: lock a specific ref
+                if (!strcmp(k, "LOCK")) locked = v > 0 ? v : 0; // test mode: lock a specific ref
                 if (!strcmp(k, "CX")) ctl_cx = v;
                 if (!strcmp(k, "CY")) ctl_cy = v;
             }
@@ -221,7 +222,7 @@ static BOOL WINAPI h_SetCursorPos(int x, int y) {
     return TRUE;
 }
 
-static SHORT WINAPI h_GetAsyncKeyState(int k) { return real_GetAsyncKeyState(k) | (vk[k & 255] ? 0x8000 : 0); }
+static SHORT WINAPI h_GetAsyncKeyState(int k) { return real_GetAsyncKeyState(k) | (vk[k & 255] ? SHRT_MIN : 0); }
 
 static BOOL WINAPI h_GetKeyboardState(PBYTE ks) {
     BOOL r = real_GetKeyboardState(ks);
@@ -262,14 +263,14 @@ enum { T_NONE, T_ENEMY, T_NPC, T_OBJECT, T_ITEM };
 static int classify(Obj *h, Obj *o) {
     int f = family(o->type);
     if (f == 2 || f == 3 || f == 0x20) {
-        if (can_attack(h, 0, o)) return T_ENEMY;
+        if (can_attack(h, NULL, o)) return T_ENEMY;
         if (*(int *)((BYTE *)o + 0x1f0) == 4) return (unsigned)o->ref == mount_ref ? T_NONE : T_OBJECT; // horse: mount it
         // Talkable: a dialog is available, or a trader (creature flags 2: 0x1000 blacksmith, 0x2000 merchant,
         // 0x4000 combat master, 0x4000000 horse trader), the same tests the game's hover cursor uses.
         if (o->ref >= 0x11 && (*(DWORD *)((BYTE *)o + 0x200) & 0x4007000)) return T_NPC;
         return o->ref >= 0x11 && has_dialog(o) > 0 ? T_NPC : T_NONE;
     }
-    if (is_item_type(TYPES, 0, o->type)) return T_ITEM;
+    if (is_item_type(TYPES, NULL, o->type)) return T_ITEM;
     return is_usable(o->type) ? T_OBJECT : T_NONE;
 }
 
@@ -278,7 +279,7 @@ static int classify(Obj *h, Obj *o) {
 static float Ji[4];
 static Ground g0;
 static void view_pick(void *view, int sx, int sy, Ground *g) {
-    ((void (__fastcall *)(void *, void *, int, int, Ground *))(*(void ***)view)[6])(view, 0, sx, sy, g);
+    ((void (__fastcall *)(void *, void *, int, int, Ground *))(*(void ***)view)[6])(view, NULL, sx, sy, g);
 }
 static void measure_view(void *view) {
     Ground a, b;
@@ -408,7 +409,7 @@ static void update_targets(void *view) {
             if (!o || o == h || !o->sector) continue;
             POINT s = to_screen(o->x, o->y);
             int k = classify(h, o);
-            if (k == T_ENEMY || (k && abs(s.x - hp.x) < 4000 && abs(s.y - hp.y) < 4000))
+            if (k == T_ENEMY || (k && labs(s.x - hp.x) < 4000 && labs(s.y - hp.y) < 4000))
                 LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0);
         }
     }
@@ -583,7 +584,7 @@ static int spot_size;
 static POINT spot;
 static void add_grid(BYTE *e) {
     int gw = *(WORD *)(e + 0x115c), gh = *(WORD *)(e + 0x115e), x0 = *(short *)(e + 0x1164), y0 = *(short *)(e + 0x1166);
-    if (gw <= 0 || gh <= 0 || gw * gh > 256) return;
+    if (gw <= 0 || gh <= 0 || gw > 256 || gh > 256 || gw * gh > 256) return;
     int sh = inventory_sheet();
     if (sh >= 0 && PtInRect(&pub_sheets[sh], (POINT){x0 + 1, y0 + 1})) { // the backpack (cells: +0 item at its top-left)
         BYTE occ[256] = {0}, sq[256];
@@ -637,7 +638,7 @@ static void snapshot_ui(void) {
                 open = 1;
                 if ((*d)->vt == (void **)0x896b3c) { // NPC text (cUI_Tooltip): up to 4 answers it draws itself
                     POINT p = ctl_pos(*d);       // records of 0x14 at +0x2180: +0 id, +4 x, +8 y, +0xc w, +0xe h
-                    for (BYTE *a = (BYTE *)*d + 0x2180; a < (BYTE *)*d + 0x2180 + 4 * 0x14; a += 0x14) {
+                    for (BYTE *a = (BYTE *)*d + 0x2180; a < (BYTE *)*d + 0x2180 + 4 * 0x14 && answers < 4; a += 0x14) {
                         int x = *(int *)(a + 4), y = *(int *)(a + 8), aw = *(short *)(a + 0xc), ah = *(short *)(a + 0xe);
                         if (aw > 0 && ah > 0)
                             ans[answers++] = (RECT){p.x + x, p.y + y, p.x + x + aw, p.y + y + ah},
@@ -704,6 +705,7 @@ static void snapshot_ui(void) {
     int w = !fpub;
     for (int i = 0; i < nsheets; i++) pub_sheets[i] = sheets[i], pub_sheet_tab[i] = sheet_tab[i];
     pub_nsheets = nsheets;
+    MemoryBarrier(); // the list is complete before it is published (volatile alone doesn't order the plain writes)
     fpub = w, fcount[!w] = 0, ngrids = 0, nsheets = 0; // publish; start the next list
 }
 
@@ -738,7 +740,7 @@ static char __fastcall h_device_setup(void *drv, void *edx, BYTE *rec, void *a2,
 
 // Movies (intro, chapter transitions, extro) go through DirectShow's amstream, which crashes under Proton 11.
 // On Wine the opener (0x6a0d80, cdecl) reports "no stream", and every caller then skips the movie.
-static int __cdecl h_movie_open(void *a, void *b, void **stream) { return *stream = 0, E_FAIL; }
+static int __cdecl h_movie_open(void *a, void *b, void **stream) { return *stream = NULL, E_FAIL; }
 
 // ---------------------------------------------------------------- overlay: button icons and the aim marker
 // Glyphs are painted once with GDI into small colour-keyed DirectDraw surfaces, then blitted onto the back
@@ -828,7 +830,7 @@ static void paint_glyph(HDC dc, int g, int w, int h) {
         HPEN pen = CreatePen(PS_SOLID, 3, c), op = SelectObject(dc, pen);
         HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
         Ellipse(dc, 2, 2 + h / 4, w - 2, h - 2 - h / 4); // flat ellipse: a circle on the isometric ground
-        if (g == G_RING) MoveToEx(dc, w / 2 - 6, h / 2, 0), LineTo(dc, w / 2 + 7, h / 2), MoveToEx(dc, w / 2, h / 2 - 5, 0), LineTo(dc, w / 2, h / 2 + 6);
+        if (g == G_RING) MoveToEx(dc, w / 2 - 6, h / 2, NULL), LineTo(dc, w / 2 + 7, h / 2), MoveToEx(dc, w / 2, h / 2 - 5, NULL), LineTo(dc, w / 2, h / 2 + 6);
         SelectObject(dc, op), SelectObject(dc, ob), DeleteObject(pen);
     } else if (g >= G_LEGEND) LEGEND(dc, g - G_LEGEND, 1);
     else paint_button(dc, 0, 0, g);
@@ -910,7 +912,7 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     if (!dd || !back || InterlockedExchange(&busy, 1)) return;
     IDirectDrawSurface7 *ref = *(IDirectDrawSurface7 **)(drv + 0xbc); // glyph format follows the back buffer
     if (ref != glyph_back) free_glyphs(), glyph_back = ref;
-    if (!glyph[0] && !make_glyphs(dd, ref)) { busy = 0; return; }
+    if (!glyph[0] && !make_glyphs(dd, ref)) { InterlockedExchange(&busy, 0); return; }
     int lt = (pad_shown & BTN_LT) != 0, in_world = hero() != NULL, world = in_world && !ui_open;
     if (aiming) put(back, G_RING, reticle.x, reticle.y);
     if (pad_mode && !world && !free_cursor && !IsRectEmpty(&focus)) frame(back, focus);
@@ -941,7 +943,7 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
             put(back, g, 12 + gsize[g].cx / 2, in_world ? 20 : 748);
         }
     }
-    busy = 0;
+    InterlockedExchange(&busy, 0); // a release the other render thread sees after our glyph writes
 }
 
 // The game's cursor draw (mouse, device, glow): skipped while the pad hides the cursor.
@@ -1016,7 +1018,7 @@ static POINT centre(RECT r) { return (POINT){(r.left + r.right) / 2, (r.top + r.
 
 static int focus_list(Focus *out) { // copy the published list; again if the render thread republished meanwhile
     int p, n;
-    do p = fpub, n = fcount[p], memcpy(out, fbuf[p], n * sizeof *out); while (p != fpub);
+    do p = fpub, MemoryBarrier(), n = fcount[p], memcpy(out, fbuf[p], n * sizeof *out), MemoryBarrier(); while (p != fpub);
     return n;
 }
 
@@ -1044,19 +1046,19 @@ static int step_focus(Focus *f, int n, int dx, int dy) {
 static struct { POINT p; int vk; } steps[8];
 static int nsteps, step_t;
 static void queue_click(int x, int y) { if (nsteps < 8) steps[nsteps].vk = 0, steps[nsteps++].p = (POINT){x, y}; }
-static void queue_key(int vk) { if (nsteps < 8) steps[nsteps++].vk = vk; }
+static void queue_key(int k) { if (nsteps < 8) steps[nsteps++].vk = k; }
 static int run_steps(void) { // 1 while busy
     if (!nsteps) return 0;
-    int vk = steps[0].vk, t = step_t++;
+    int k = steps[0].vk, t = step_t++;
     POINT c = steps[0].p;
-    if (vk) { if (t == 0) tap(vk); }
+    if (k) { if (t == 0) tap(k); }
     else {
         if (t == 0) move_cursor(c.x - 1, c.y);
         if (t == 6) move_cursor(c.x, c.y);
         if (t == 12) key(VK_LBUTTON, 1);
         if (t == 16) key(VK_LBUTTON, 0);
     }
-    if (step_t >= (vk ? 16 : 24)) memmove(steps, steps + 1, --nsteps * sizeof *steps), step_t = 0;
+    if (step_t >= (k ? 16 : 24)) memmove(steps, steps + 1, --nsteps * sizeof *steps), step_t = 0;
     return 1;
 }
 
@@ -1065,9 +1067,10 @@ static int run_steps(void) { // 1 while busy
 enum { PG_INV = 0, PG_QUEST = 3, PG_MENU = 7, PG_N = 8 };
 static int cur_page(void) {
     DWORD w = wins;
+    int s = inventory_sheet(); // once: the render thread republishes the sheets meanwhile
     if (w & 1u << 12) return PG_MENU;
     if (w & 1u << 10) return PG_QUEST + diary_tab % 4;
-    if ((w & 1u << 1) && !(w & 1u << 4) && inventory_sheet() >= 0) return PG_INV + pub_sheet_tab[inventory_sheet()];
+    if ((w & 1u << 1) && !(w & 1u << 4) && s >= 0) return PG_INV + pub_sheet_tab[s];
     return -1;
 }
 static int page_id(void) { // what LB / RB page through: a panel page, or the tab of a merchant's wares
@@ -1077,10 +1080,13 @@ static int page_id(void) { // what LB / RB page through: a panel page, or the ta
 }
 static int pending_page = -1;
 static DWORD pending_until, pending_click;
+static int past(DWORD t) { return GetTickCount() - t < 0x80000000u; } // now >= t, across the 49.7-day wrap
 static void click_tab(int page) { // a tab of the panel already open
     POINT c;
     if (page < PG_QUEST) {
-        RECT r = pub_sheets[inventory_sheet()];
+        int s = inventory_sheet();
+        if (s < 0) return; // the inventory closed meanwhile
+        RECT r = pub_sheets[s];
         c = (POINT){r.left + (int[]){73, 229, 391}[page], r.top};
     } else c = centre(diary_tabs[page - PG_QUEST]);
     free_cursor = 0;
@@ -1093,13 +1099,13 @@ static void goto_page(int page) {
     if (cur == PG_MENU) queue_key(VK_ESCAPE);                   // leave the game menu first
     if (page == PG_MENU) queue_key(VK_ESCAPE), queue_key(VK_ESCAPE); // close the panel, open the menu
     else queue_key(page < PG_QUEST ? 'I' : 'L');                 // the game swaps inventory <-> quest log itself
-    pending_page = page, pending_until = GetTickCount() + 2000, pending_click = 0;
+    pending_page = page, pending_until = GetTickCount() + 2000, pending_click = GetTickCount();
 }
 static void settle_page(void) { // after a panel switch: click the wanted tab once the panel is up
     if (pending_page < 0) return;
     int cur = cur_page();
-    if (cur == pending_page || GetTickCount() > pending_until) { pending_page = -1; return; }
-    if (cur >= 0 && (cur < PG_QUEST) == (pending_page < PG_QUEST) && pending_page != PG_MENU && GetTickCount() > pending_click)
+    if (cur == pending_page || past(pending_until)) { pending_page = -1; return; }
+    if (cur >= 0 && (cur < PG_QUEST) == (pending_page < PG_QUEST) && pending_page != PG_MENU && past(pending_click))
         click_tab(pending_page), pending_click = GetTickCount() + 400;
 }
 
@@ -1166,6 +1172,7 @@ static void update_menu(void) {
         else {
             POINT c = centre(focus);
             float bd = 1e9f;
+            cur = 0;
             for (int i = 0; i < n; i++) {
                 POINT q = centre(f[i].r);
                 float d = hypotf(q.x - c.x, q.y - c.y);
@@ -1179,8 +1186,8 @@ static void update_menu(void) {
     memcpy(last, f, n * sizeof *f), nlast = n;
     if (want_until) // a follow-up entry (Start Game, Load / Save) appeared: go there
         for (int i = 0; i < n; i++)
-            if (PtInRect(&f[i].r, want) || GetTickCount() > want_until) {
-                if (GetTickCount() <= want_until) focus = f[cur = i].r, move_cursor(centre(focus).x, centre(focus).y), fresh = 0;
+            if (PtInRect(&f[i].r, want) || past(want_until)) {
+                if (!past(want_until)) focus = f[cur = i].r, move_cursor(centre(focus).x, centre(focus).y), fresh = 0;
                 want_until = 0;
                 break;
             }
@@ -1279,8 +1286,8 @@ static void update_menu(void) {
 
     // LB/RB: a merchant's tabs while trading; otherwise the panel cycle; otherwise the tabs under the focus.
     if ((PRESSED(LB) || PRESSED(RB)) && !carrying && !modal) {
-        int dir = PRESSED(RB) ? 1 : -1, page = cur_page();
-        if (!(wins & 1u << 4) && page >= 0) goto_page((page + dir + PG_N) % PG_N);
+        int dir = PRESSED(RB) ? 1 : -1, pg = cur_page();
+        if (!(wins & 1u << 4) && pg >= 0) goto_page((pg + dir + PG_N) % PG_N);
         else if (pub_nsheets) {
             POINT c = centre(focus);
             int k = 0;
@@ -1468,7 +1475,7 @@ static LONG WINAPI h_SetWindowLongA(HWND h, int i, LONG v) {
 static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int w, int h,
                                      HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
     HWND r = real_CreateWindowExA(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
-    LOG("CreateWindowExA cls=%s name=%s style=%08lx -> %p", HIWORD(cls) ? cls : "#", name ? name : "", style, r);
+    LOG("CreateWindowExA cls=%s name=%s style=%08lx -> %p", HIWORD(cls) ? cls : "#", name ? name : "", style, (void *)r);
     if (r && !parent && !game) {
         game = r;
         patch_engine();
@@ -1503,7 +1510,7 @@ static LONG CALLBACK crash_log(EXCEPTION_POINTERS *e) {
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
         code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION)
         return EXCEPTION_CONTINUE_SEARCH;
-    HMODULE m = 0;
+    HMODULE m = NULL;
     char name[MAX_PATH] = "?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            r->ExceptionAddress, &m))
@@ -1533,7 +1540,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res) {
     DisableThreadLibraryCalls(inst);
     logfile = fopen("sacredpad.log", "w");
     char env[MAX_PATH];
-    if (GetEnvironmentVariableA("SACREDPAD_CTL", env, sizeof env))
+    DWORD envn = GetEnvironmentVariableA("SACREDPAD_CTL", env, sizeof env);
+    if (envn && envn < sizeof env) // (too long: env is left unterminated)
         snprintf(ctl_path, sizeof ctl_path, "%s%s", env[0] == '/' ? "Z:" : "", env);
     else if (GetFileAttributesA("sacredpad_ctl.txt") != INVALID_FILE_ATTRIBUTES) // test hook for Steam launches
         strcpy(ctl_path, "sacredpad_ctl.txt");
