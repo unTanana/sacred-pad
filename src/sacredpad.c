@@ -48,6 +48,7 @@ static void load_settings(void) {
 // ---------------------------------------------------------------- pad
 typedef struct { float lx, ly, rx, ry, lt, rt; WORD btn; } Pad; // sticks -1..1 (y up), triggers 0..1
 static Pad pad, prev;
+static volatile WORD pad_shown; // the buttons as of the last complete tick, for the render thread
 static char ctl_path[MAX_PATH]; // test mode: pad state comes from this file instead of XInput
 static DWORD (WINAPI *xget)(DWORD, XINPUT_STATE *);
 static int ctl_cx = -1, ctl_cy = -1; // test mode: CX=/CY= put the cursor at an exact client position
@@ -170,6 +171,8 @@ static void key(int k, int down) {
 static void move_cursor(int x, int y) {
     x = x < 0 ? 0 : x > 1023 ? 1023 : x;
     y = y < 0 ? 0 : y > 767 ? 767 : y;
+    BYTE *mouse = *(BYTE **)0xcddb5c; // the game's mouse: +4/+8 is where its cursor sprite is drawn
+    if (mouse) *(int *)(mouse + 4) = x, *(int *)(mouse + 8) = y; // the fullscreen menus never refresh it themselves
     if (x == vcur.x && y == vcur.y) return;
     vcur = (POINT){x, y};
     PostMessageA(game, WM_MOUSEMOVE, mk(), MAKELPARAM(x, y));
@@ -582,20 +585,25 @@ static void put(IDirectDrawSurface7 *back, int g, int cx, int cy) { // centred o
     if (x + src.right - src.left > 1024) src.right = src.left + 1024 - x;
     if (y + src.bottom - src.top > 768) src.bottom = src.top + 768 - y;
     if (src.right <= src.left || src.bottom <= src.top) return;
-    if (IDirectDrawSurface7_BltFast(back, x, y, glyph[g], &src, DDBLTFAST_SRCCOLORKEY | DDBLTFAST_WAIT) == DDERR_SURFACELOST)
-        free_glyphs(); // a mode switch: rebuild next frame
+    HRESULT hr = IDirectDrawSurface7_BltFast(back, x, y, glyph[g], &src, DDBLTFAST_SRCCOLORKEY | DDBLTFAST_WAIT);
+    static HRESULT last_hr = 1;
+    if (hr != last_hr) LOG("overlay: BltFast(%p) -> %08lx", (void *)back, hr), last_hr = hr;
+    if (hr == DDERR_SURFACELOST) free_glyphs(); // a mode switch: rebuild next frame
 }
 
 // HUD geometry (1024x768): art slots 6..0 grow right from x=670, weapon slots 1..n end at x=362; one slot more at
 // levels 2, 8, 16 and 30. Potions sit on the compass at the top of the HUD.
-static void draw_overlay(BYTE *drv) {
+static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     static volatile LONG busy;
     IDirectDraw7 *dd = *(IDirectDraw7 **)(drv + 0xb4);
-    IDirectDrawSurface7 *back = *(IDirectDrawSurface7 **)(drv + 0xbc);
     if (!dd || !back || InterlockedExchange(&busy, 1)) return;
-    if (back != glyph_back) free_glyphs(), glyph_back = back;
-    if (!glyph[0] && !make_glyphs(dd, back)) { busy = 0; return; }
-    int lt = DOWN(BTN_LT), world = hero() && !ui.open;
+    IDirectDrawSurface7 *ref = *(IDirectDrawSurface7 **)(drv + 0xbc); // glyph format follows the back buffer
+    if (ref != glyph_back) free_glyphs(), glyph_back = ref;
+    if (!glyph[0] && !make_glyphs(dd, ref)) { busy = 0; return; }
+    int lt = (pad_shown & BTN_LT) != 0, world = hero() && !ui.open;
+    static int last_mode = -1;
+    int mode = !hero() ? 0 : world ? 1 : 2;
+    if (mode != last_mode) LOG("overlay: %s", (const char *[]){"main menu", "world", "panel"}[mode]), last_mode = mode;
     if (aiming) put(back, G_RING, reticle.x, reticle.y);
     if (cfg.hints && pad_mode) {
         if (world) {
@@ -615,13 +623,26 @@ static void draw_overlay(BYTE *drv) {
 }
 
 static void (__fastcall *flip)(void *) = (void *)0x645e40;
-static void __fastcall h_flip(void *drv) { draw_overlay(drv), flip(drv); }
+static void __fastcall h_flip(void *drv) {
+    BYTE *d = drv;
+    // The fullscreen main menu (menu thread, 0x757250) does not show what is blitted onto its back buffer:
+    // there the overlay goes onto the front surface right after the flip.
+    if (__builtin_return_address(0) == (void *)0x757255 && *(int *)(d + 0x90) == 1) {
+        draw_overlay(d, *(IDirectDrawSurface7 **)(d + 0xbc));
+        flip(drv);
+        draw_overlay(d, *(IDirectDrawSurface7 **)(d + 0xb8));
+        return;
+    }
+    draw_overlay(d, *(IDirectDrawSurface7 **)(d + 0xbc));
+    flip(drv);
+}
 
 static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e. once the window exists
     patch_call(0x64490d, h_device_setup);
     if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_jmp(0x6a0d80, h_movie_open);
     patch_call(0x60ea8a, h_flip);        // world frame present
     patch_call(0x757250, h_flip);        // menu-thread present (main menu)
+    patch_call(0x646b43, h_flip);        // GDI-drawn frames (loading, fullscreen menus)
     patch_call(0x60e9c7, h_cursor_pass); // engine frame loop
     patch_call(0x60ea01, h_cursor_pass);
     patch_call(0x611f64, h_pick_hover);  // hover inside the cursor pass
@@ -838,6 +859,7 @@ static void tick(void) {
     read_pad();
     if (pad.lt > 0.5f) pad.btn |= BTN_LT;
     if (pad.rt > 0.5f) pad.btn |= BTN_RT;
+    pad_shown = pad.btn;
     if (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) pad_mode = 1;
     if (ctl_cx >= 0) pad_mode = 1, cursor_mode = 1, cursor_idle = 0, move_cursor(ctl_cx, ctl_cy);
     static int last_open = -1;

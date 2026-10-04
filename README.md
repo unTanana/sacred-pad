@@ -33,6 +33,8 @@ In the world:
 | LT + X Y B RB RT | Weapon slots 1–5 |
 | LB (hold) | Show names, target loot only; LB + A picks it up (nothing in reach: collect all) |
 | D-pad ↑ → ← ↓ | Healing potion (Space), Q, E, R potions; LT + ↑: W potion |
+| Hold an art button + right stick | Aim: a ring marks the spot; let go of the art button to cast there |
+| A on a horse / LT + A while riding | Mount / dismount |
 | R3 | Lock / unlock the current target |
 | L3 | Toggle stand-still (Ctrl: attack in place) |
 | Right stick | Manual cursor (aims arts at a spot); auto-targeting returns 2 s after you let go |
@@ -40,8 +42,12 @@ In the world:
 | Back / LT + Back | Inventory / map |
 | Start / LT + Start | Game menu / quest log |
 
-Targeting picks the best enemy in front of where you're steering (enemies first, then NPCs and
-containers), sticks to it while you hold the button, and uses the game's own highlight and info bar.
+Targeting picks the best enemy in front of where you're steering (enemies first, then NPCs, containers and
+horses), sticks to it while you hold the button, and uses the game's own highlight and info bar.
+
+Button icons show which button fires which slot (they move to the weapon slots while LT is held), which D-pad
+direction drinks which potion, an A above the current target, a red ring on a locked target, and a short
+legend in menus.
 
 In menus, inventory, trade and dialogs:
 
@@ -55,12 +61,27 @@ In menus, inventory, trade and dialogs:
 
 The mouse keeps working: moving it hands the cursor back until you touch the pad again.
 
+## Settings
+
+`sacredpad.ini` is created next to the game on first start (delete it to get the defaults back):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `deadzone` | 24 | Stick dead zone, percent |
+| `cursor_speed` | 12 | Cursor speed in menus and for manual aiming |
+| `target_range` | 480 | How far auto-targeting looks (screen pixels) |
+| `hints` | 1 | Button icons (0 = off) |
+| `d2r_loot` | 0 | 1 = A also picks up loot, like D2R (otherwise hold LB) |
+| `manual_aim_ms` | 2000 | How long the right-stick cursor stays manual before auto-targeting returns |
+
 ## Notes
 
 - Under Wine/Proton the movies (intro, chapter transitions) are skipped: DirectShow crashes there.
 - The game keeps running when it loses focus (it used to freeze).
-- Not done yet: on-screen button hints, rebinding/config file, dismount button (Shift+click the horse
-  with a mouse), hold-to-aim reticle for ground arts (use the right stick).
+- Not verified in a live game: mounting/dismounting (no horse near the test saves; the dismount path is the
+  game's own Shift+click on the ridden horse). The fullscreen main menu may not show the legend/cursor
+  reliably (my screen captures of it were inconsistent); in the world everything was verified fullscreen.
+- No button remapping yet.
 - `sacredpad.log` next to the game says what the mod did.
 
 ## Development

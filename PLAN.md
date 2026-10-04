@@ -59,20 +59,20 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - [x] 2.1 Hero world position + world→screen projection
 - [x] 2.2 Entity enumeration: type, hostility, alive, position
 - [x] 2.3 Auto-target: cone score, sticky, R3 lock, right-stick bias; aim + click
-- [x] 2.4 Combat arts on buttons; LT page = weapon slots; ground arts: tap = target/ahead, right stick = manual aim (no reticle yet)
+- [x] 2.4 Combat arts on buttons; LT page = weapon slots; hold art + right stick = ground marker, cast on release
 - [x] 2.5 Loot: LB-held item targeting, A picks up, LB+A with nothing in reach = collect all
-- [x] 2.6 Stand still (L3); mount = A on the horse. Dismount button: not yet
+- [x] 2.6 Stand still (L3); mount = A on a horse, LT+A dismounts (not live-tested)
 
 ### Phase 3 — controller UI
 - [x] 3.1 Open-panel detection
 - [x] 3.2 Grid snapping: inventory, equipment, chest, trader (32px cells + button jumps)
 - [x] 3.3 Dialog navigation (cursor warps to OK; D-pad between buttons)
-- [ ] 3.4 Xbox button-icon hints (not done)
+- [x] 3.4 Xbox button icons: slots, potions, target prompt, lock ring, menu legend, aim ring
 
 ### Phase 4 — ship
 - [x] 4.1 install.sh / uninstall.sh for the Steam install
 - [x] 4.2 Verified on the real install via Proton 11 (DRM exe, fullscreen): menus + pad input. Needed two Proton fixes
-- [ ] 4.3 `sacredpad.ini` (skipped until something needs tuning)
+- [x] 4.3 `sacredpad.ini`: deadzone, cursor speed, target range, hints, d2r_loot, manual-aim timeout
 - [x] 4.4 README (incl. Steam Input: use the "Gamepad" template)
 
 ## Findings
@@ -93,5 +93,11 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - UI: cUI_Manager `*0x17eebbc`, windows at +0x80 (23 slots), dialogs [+0x124, +0x128); control: +0x10 flags
   (bit 0 visible), +0x24/+0x28 pos (parent-relative), +0x2c/+0x2e size, +0x30 name, +0x50 parent,
   +0x78/+0x7c children. NPC text dialog = cUI_Tooltip (vtable 0x896b3c) with OK drawn bottom centre.
+- Crash on Start (2026-10-04): UI +0x78 is a child list only on some window classes; walking it blindly on
+  the Esc menu followed garbage. All UI pointers are now validated.
+- Present: 0x645e40 (thiscall driver) from 0x60ea8a (world), 0x757250 (menu thread), 0x646b43 (GDI frames).
+  Fullscreen flips the front (+0xb8); mouse singleton `*0xcddb5c`, +4/+8 = cursor sprite position.
+- Hero +0x3fe level (HUD slots: 1 + at levels 2, 8, 16, 30), +0x1ec ridden horse, creature +0x1f0 == 4: horse.
+  Dismount = Shift + click whose picked ref is the ridden horse (click handler 0x6172c0).
 - Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
   Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.
