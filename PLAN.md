@@ -111,5 +111,13 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - Cursor draw: 0x655450 (thiscall mouse, dev, glow), from 0x612e6a/0x612e91 (world) and 0x757227 (menus).
 - Main menu runs on its own thread (no world frame loop): UI snapshot is taken at every present instead.
 - Character select: heroes are models on 8 pedestals (screen points in snapshot_ui), same on the Import page.
+- NPC dialog answers are drawn by cUI_Tooltip itself: 4 records of 0x14 at +0x2180 (+4 x, +8 y, +0xc w,
+  +0xe h, relative to the dialog). Confirmation pop-ups: cUI_BusyDlg (render 0x721b10, called every frame,
+  visible or not); its buttons are parentless, so the modal set = what draws after it.
+- Tab sheets: cUI_TabSheet (render 0x7297f0) draws its header row 26 px above the sheet, tabs at +73/+229/+391.
+- Traders: creature +0x200 flags 0x1000 smith, 0x2000 merchant, 0x4000 combat master, 0x4000000 horse trader
+  (has_dialog is 0 for them). The game swaps window procedures through a delay-loaded SetWindowLongA pointer
+  (0xa23fb4): redirected so the mod's procedure stays first. The pad's own mouse messages carry MK 0x8000
+  (stripped before the game), so late-arriving ones are never mistaken for the real mouse.
 - Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
   Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.

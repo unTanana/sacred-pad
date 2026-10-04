@@ -56,6 +56,8 @@ static volatile int ctl_dump;          // test mode: DUMP logs the classified ob
 static volatile int ctl_far;           // test mode: FAR lifts the target radius / on-screen limit
 static volatile int ctl_uiscan;        // test mode: UISCAN logs controls found by scanning window memory
 static volatile int ctl_focus;         // test mode: FOCUS logs the focus list
+static volatile int rendlog;           // test mode: REND logs the next draws of clickable controls
+static volatile int ctl_trace;         // test mode: TRACE logs the target every frame for a while
 static volatile unsigned target, locked; // soft target; R3 lock
 static volatile unsigned mount_ref;         // the horse the hero rides (hero +0x1ec), 0 on foot
 static volatile int hero_level;             // hero +0x3fe: decides how many HUD slots are unlocked
@@ -98,6 +100,8 @@ static void read_pad(void) {
             if (!strcmp(t, "FAR")) ctl_far = 1;
             if (!strcmp(t, "UISCAN")) ctl_uiscan = 1;
             if (!strcmp(t, "FOCUS")) ctl_focus = 1;
+            if (!strcmp(t, "REND")) rendlog = 400;
+            if (!strcmp(t, "TRACE")) ctl_trace = 180;
         }
         if (f) fclose(f);
         return;
@@ -141,6 +145,7 @@ enum { A = XINPUT_GAMEPAD_A, B = XINPUT_GAMEPAD_B, X = XINPUT_GAMEPAD_X, Y = XIN
 // ---------------------------------------------------------------- virtual mouse/keyboard
 static HWND game;
 static WNDPROC game_proc;
+static LRESULT CALLBACK game_wndproc(HWND, UINT, WPARAM, LPARAM);
 static POINT vcur = {512, 384}; // client coords (game is 1024x768)
 static BYTE vk[256];            // 0x80 = held by the pad
 static int pad_mode;            // 1 = pad owns the cursor; real mouse movement switches back
@@ -153,9 +158,10 @@ static HWND (WINAPI *real_GetForegroundWindow)(void);
 static HWND (WINAPI *real_GetFocus)(void);
 static HWND (WINAPI *real_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 
+#define MK_OURS 0x8000 // tags the mouse messages the pad posts; stripped before the game sees them
 static WPARAM mk(void) {
     return (vk[VK_LBUTTON] ? MK_LBUTTON : 0) | (vk[VK_RBUTTON] ? MK_RBUTTON : 0) |
-           (vk[VK_SHIFT] ? MK_SHIFT : 0) | (vk[VK_CONTROL] ? MK_CONTROL : 0);
+           (vk[VK_SHIFT] ? MK_SHIFT : 0) | (vk[VK_CONTROL] ? MK_CONTROL : 0) | MK_OURS;
 }
 
 static void key(int k, int down) {
@@ -237,6 +243,9 @@ static int classify(Obj *h, Obj *o) {
     if (f == 2 || f == 3 || f == 0x20) {
         if (can_attack(h, 0, o)) return T_ENEMY;
         if (*(int *)((BYTE *)o + 0x1f0) == 4) return (unsigned)o->ref == mount_ref ? T_NONE : T_OBJECT; // horse: mount it
+        // Talkable: a dialog is available, or a trader (creature flags 2: 0x1000 blacksmith, 0x2000 merchant,
+        // 0x4000 combat master, 0x4000000 horse trader), the same tests the game's hover cursor uses.
+        if (o->ref >= 0x11 && (*(DWORD *)((BYTE *)o + 0x200) & 0x4007000)) return T_NPC;
         return o->ref >= 0x11 && has_dialog(o) > 0 ? T_NPC : T_NONE;
     }
     if (is_item_type(TYPES, 0, o->type)) return T_ITEM;
@@ -302,7 +311,7 @@ static void ui_scan(Ctl *w, int depth) {
             continue;
         }
         Ctl **b = (Ctl **)f[0], **e = (Ctl **)f[1];
-        if ((DWORD)b > 0x10000 && e > b && e - b <= 256 && !IsBadReadPtr(b, (e - b) * 4) && ctl_ok(*b) && owned_by(*b, w)) {
+        if ((DWORD)b > 0x10000 && e > b && e - b <= 512 && !IsBadReadPtr(b, (e - b) * 4) && ctl_ok(*b) && owned_by(*b, w)) {
             LOG("scan %*s +%03x vec[%d]", depth * 2, "", off, (int)(e - b));
             for (Ctl **k = b; k < e; k++) {
                 if (!ctl_ok(*k)) continue;
@@ -358,7 +367,8 @@ static void update_targets(void *view) {
         if (score >= best && r != target && r != locked) continue; // can't win: skip the game's (costly) checks
         int k = classify(h, o);
         if (!k || (loot_mode && k != T_ITEM) || (!loot_mode && k == T_ITEM && !cfg.d2r_loot)) continue;
-        score += k == T_ENEMY ? 0 : k == T_ITEM && !loot_mode ? 600 : 400; // enemies first
+        static const float penalty[] = {0, 0, 250, 400, 600}; // enemies, then people, then objects, loot last
+        score += k == T_ITEM && loot_mode ? 0 : penalty[k];
         if (r == target) score = holding ? -1 : score * 0.75f;      // sticky; fixed while acting
         if (r == locked) score = -2;
         if (score < best) best = score, best_ref = r, best_pos = s, target_kind = k;
@@ -366,7 +376,7 @@ static void update_targets(void *view) {
     if (locked && best_ref != locked) locked = 0; // lock lost (dead, gone, off screen)
     if (ctl_dump) {
         ctl_dump = 0;
-        LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked);
+        LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u wndproc_ours=%d", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked, GetWindowLongA(game, GWL_WNDPROC) == (LONG)game_wndproc);
         POINT at = to_screen(*(int *)((BYTE *)h + 0x108), *(int *)((BYTE *)h + 0x10c));
         LOG("dump: hero action=%d target=%u at screen %ld,%ld level=%d mount=%u", *(short *)((BYTE *)h + 0xfc),
             *(unsigned *)((BYTE *)h + 0x100), at.x, at.y, hero_level, mount_ref);
@@ -376,10 +386,11 @@ static void update_targets(void *view) {
             POINT s = to_screen(o->x, o->y);
             int k = classify(h, o);
             if (k == T_ENEMY || (k && abs(s.x - hp.x) < 4000 && abs(s.y - hp.y) < 4000))
-                LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0);
+                LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d f2=%lx", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0, k == T_NPC ? *(DWORD *)((BYTE *)o + 0x200) : 0);
         }
     }
     target = best_ref, target_pos = best_pos;
+    if (ctl_trace > 0) ctl_trace--, LOG("trace target=%u kind=%d at %ld,%ld best=%.0f mode=%d", best_ref, target_kind, best_pos.x, best_pos.y, best, pad_mode);
 }
 
 // ---------------------------------------------------------------- focus: what can be selected on screen
@@ -391,6 +402,7 @@ enum { F_CTL, F_ITEM, F_SLOT, F_CELL };
 #define MAXF 256
 static Focus fbuf[2][MAXF];
 static volatile int fpub, fcount[2]; // fbuf[fpub] is the published list, fbuf[!fpub] is being built
+static volatile int fmodal[2];       // the list belongs to a confirmation pop-up (focus starts afresh there)
 static volatile int carrying;        // an item hangs on the cursor (mouse +0x68)
 static RECT focus;                   // current menu focus; empty = none
 static int free_cursor;              // the right stick took over in a menu
@@ -413,18 +425,51 @@ static void (__fastcall *render_orig[16])(void *, void *, void *);
 static void __fastcall h_render(Ctl *c, void *edx, void *dev) {
     int i = 0;
     while (clickable[i].vt && clickable[i].vt != (DWORD)c->vt) i++;
+    if (rendlog > 0 && rendlog--) { Ctl *r = c; for (int k = 0; k < 16 && ctl_ok(r->parent); k++) r = r->parent;
+        POINT p = ctl_pos(c); LOG("rend %.24s vt=%p flags=%x cmd=%p at %ld,%ld %dx%d root=%.20s", c->name, (void *)c->vt, c->flags, clickable[i].cmd ? *(void **)((BYTE *)c + clickable[i].cmd) : 0, p.x, p.y, c->w, c->h, r->name); }
     if (clickable[i].vt && (c->flags & 5) == 5 && (!clickable[i].cmd || *(void **)((BYTE *)c + clickable[i].cmd))) {
         Ctl *root = c;
         for (int k = 0; k < 16 && ctl_ok(root->parent); k++) root = root->parent;
-        // Not the HUD: the taskbar, the party portraits, and parentless buttons (the compass potions).
-        if (root != c && root->vt != (void **)0x896ac0 && root->vt != (void **)0x8968cc) {
+        // Not the HUD: the taskbar, the party portraits, and the compass potions (parentless 32x32 buttons that
+        // stay up in the world; screens like the character select and the save menu use parentless buttons too).
+        if (root->vt != (void **)0x896ac0 && root->vt != (void **)0x8968cc && !(root == c && c->w <= 34 && c->h <= 34)) {
             POINT p = ctl_pos(c);
             add_focus((RECT){p.x, p.y, p.x + c->w, p.y + c->h}, F_CTL);
         }
     }
     render_orig[i](c, edx, dev);
 }
+// Tab sheets (cUI_TabSheet: backpack/combat arts/combo, the merchant's weapons/armour/misc...) draw their own
+// header row 26 px above the sheet; tabs are centred at +73, +229, +391. ponytail: three tabs assumed, read the
+// tab count from the sheet if a screen with fewer/more ever turns up.
+static volatile RECT sheets[4];
+static volatile int nsheets;
+static RECT pub_sheets[4];
+static volatile int pub_nsheets;
+static void (__fastcall *sheet_render)(void *, void *, void *) = (void *)0x7297f0;
+static void __fastcall h_sheet_render(Ctl *c, void *edx, void *dev) {
+    if ((c->flags & 1) && nsheets < 4) {
+        POINT p = ctl_pos(c);
+        sheets[nsheets++] = (RECT){p.x, p.y - 26, p.x + c->w, p.y + c->h};
+        static const int tab_x[] = {73, 229, 391};
+        for (int i = 0; i < 3; i++) add_focus((RECT){p.x + tab_x[i] - 70, p.y - 38, p.x + tab_x[i] + 70, p.y - 14}, F_CTL);
+    }
+    sheet_render(c, edx, dev);
+}
+
+// The confirmation pop-up's draw (cUI_BusyDlg, vtable slot 5): what is recorded after it starts is the pop-up's.
+static volatile int modal_mark = -1;
+static void (__fastcall *busy_render)(void *, void *, void *) = (void *)0x721b10;
+static void __fastcall h_busy_render(void *dlg, void *edx, void *dev) {
+    if (((Ctl *)dlg)->flags & 1) modal_mark = fcount[!fpub]; // it is called every frame, visible or not
+    busy_render(dlg, edx, dev);
+}
 static void hook_renders(void) {
+    void **slot = (void **)0x897134 + 5;
+    DWORD old;
+    VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_busy_render, VirtualProtect(slot, 4, old, &old);
+    slot = (void **)0x897258 + 5;
+    VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_sheet_render, VirtualProtect(slot, 4, old, &old);
     for (int i = 0; clickable[i].vt; i++) {
         void **slot = (void **)clickable[i].vt + 5;
         DWORD old;
@@ -469,13 +514,17 @@ static void snapshot_ui(void) {
         for (; d && d < end; d++)
             if (ctl_ok(*d) && ((*d)->flags & 1)) {
                 open = 1;
-                if ((*d)->vt == (void **)0x896b3c && (*d)->w >= 300 && (*d)->h >= 100) { // NPC text: OK drawn bottom centre
-                    POINT p = ctl_pos(*d);
-                    add_focus((RECT){p.x + (*d)->w / 2 - 30, p.y + (*d)->h - 30, p.x + (*d)->w / 2 + 30, p.y + (*d)->h - 8}, F_CTL);
+                if ((*d)->vt == (void **)0x896b3c) { // NPC text (cUI_Tooltip): up to 4 answers it draws itself
+                    POINT p = ctl_pos(*d);       // records of 0x14 at +0x2180: +0 id, +4 x, +8 y, +0xc w, +0xe h
+                    for (BYTE *a = (BYTE *)*d + 0x2180; a < (BYTE *)*d + 0x2180 + 4 * 0x14; a += 0x14) {
+                        int x = *(int *)(a + 4), y = *(int *)(a + 8), aw = *(short *)(a + 0xc), ah = *(short *)(a + 0xe);
+                        if (aw > 0 && ah > 0) add_focus((RECT){p.x + x, p.y + y, p.x + x + aw, p.y + y + ah}, F_CTL);
+                    }
                 }
             }
         // Character select / import: the heroes stand on eight pedestals (3D models, not controls).
-        if (ctl_ok(w[20]) && (w[20]->flags & 1)) {
+        Ctl *ch = ctl_ok(w[20]) ? w[20] : *(Ctl **)(m + 0x134); // in the world / from the main menu
+        if (ctl_ok(ch) && ch->vt == (void **)0x896fa8 && (ch->flags & 1)) {
             static const POINT pedestal[] = {{100, 470}, {216, 360}, {380, 400}, {524, 440}, {630, 340}, {730, 420}, {810, 350}, {890, 480}};
             for (int i = 0; i < 8; i++) add_focus((RECT){pedestal[i].x - 30, pedestal[i].y - 60, pedestal[i].x + 30, pedestal[i].y + 60}, F_CTL);
         }
@@ -488,9 +537,19 @@ static void snapshot_ui(void) {
                     add_focus((RECT){p.x, p.y, p.x + (*slot)->w, p.y + (*slot)->h}, F_SLOT);
                 }
     }
+    // A confirmation pop-up (cUI_BusyDlg: Quit? Load game? ...) is modal: only what it drew is focusable.
+    int nb = !fpub, modal = modal_mark >= 0;
+    if (modal) {
+        int k = modal_mark, n = fcount[nb] - k;
+        memmove(fbuf[nb], fbuf[nb] + k, (n > 0 ? n : 0) * sizeof *fbuf[nb]);
+        fcount[nb] = n > 0 ? n : 0, open = 1, modal_mark = -1;
+    }
+    fmodal[nb] = modal;
     ui.open = open;
     int w = !fpub;
-    fpub = w, fcount[!w] = 0, ngrids = 0; // publish; start the next list
+    for (int i = 0; i < nsheets; i++) pub_sheets[i] = sheets[i];
+    pub_nsheets = nsheets;
+    fpub = w, fcount[!w] = 0, ngrids = 0, nsheets = 0; // publish; start the next list
 }
 
 // The engine's per-frame cursor pass (engine thread). Targeting runs here, before the pass skips its pick
@@ -810,10 +869,13 @@ static int step_focus(Focus *f, int n, int dx, int dy) {
     return best;
 }
 
+static int release; // ticks until a scripted click is released
+
 static void update_menu(void) {
     static Focus f[MAXF];
-    static int repeat, tab;
-    int n = focus_list(f);
+    static int repeat, tab, was_modal;
+    int n = focus_list(f), modal = fmodal[fpub];
+    if (modal != was_modal) SetRectEmpty(&focus), was_modal = modal; // a pop-up opened or closed: start afresh
 
     // Keep the focus if it is still on screen; otherwise take the nearest (or the first for a new screen).
     int cur = -1;
@@ -870,16 +932,24 @@ static void update_menu(void) {
         for (int i = 0; i < n; i++) LOG("focus  %d kind=%d %ld,%ld-%ld,%ld", i, f[i].kind, f[i].r.left, f[i].r.top, f[i].r.right, f[i].r.bottom);
     }
 
-    key(VK_LBUTTON, DOWN(A));
+    if (!release) key(VK_LBUTTON, DOWN(A));
     key(VK_RBUTTON, DOWN(X)); // equip / use
     if (PRESSED(B) || PRESSED(XINPUT_GAMEPAD_START)) tap(VK_ESCAPE);
     if (PRESSED(XINPUT_GAMEPAD_BACK)) tap('I');
-    if (PRESSED(LB) || PRESSED(RB)) { // inventory tabs: backpack, combat arts, combo
-        static const POINT tabs[] = {{73, 362}, {229, 362}, {391, 362}};
-        tab = (tab + (PRESSED(RB) ? 1 : 2)) % 3;
-        POINT back = vcur;
-        move_cursor(tabs[tab].x, tabs[tab].y), key(VK_LBUTTON, 1), key(VK_LBUTTON, 0), move_cursor(back.x, back.y);
+    // LB/RB: focus the previous/next tab of the sheet holding the focus and click it (released next tick, so the
+    // game sees the click where the cursor is).
+    if (release && !--release) key(VK_LBUTTON, 0);
+    if ((PRESSED(LB) || PRESSED(RB)) && pub_nsheets) {
+        static int tabs[4];
+        POINT c = centre(focus);
+        int k = 0;
+        for (int i = 0; i < pub_nsheets; i++) if (PtInRect(&pub_sheets[i], c)) k = i;
+        tabs[k] = (tabs[k] + (PRESSED(RB) ? 1 : 2)) % 3;
+        int x = pub_sheets[k].left + (int[]){73, 229, 391}[tabs[k]], y = pub_sheets[k].top + 14;
+        focus = (RECT){x - 70, y - 12, x + 70, y + 12}, free_cursor = 0;
+        move_cursor(x, y), key(VK_LBUTTON, 1), release = 2;
     }
+    (void)tab;
 }
 
 static void update(void) {
@@ -1020,9 +1090,24 @@ static DWORD WINAPI tick_thread(LPVOID unused) {
 static LRESULT CALLBACK game_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // Keep running and accepting input while unfocused (alt-tab, or a hidden workspace while testing).
     if ((m == WM_ACTIVATEAPP && !w) || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) || m == WM_KILLFOCUS) return 0;
-    if (m == WM_MOUSEMOVE && pad_mode && !*ctl_path && (GET_X_LPARAM(l) != vcur.x || GET_Y_LPARAM(l) != vcur.y))
-        pad_mode = 0; // real mouse moved: hand the cursor back
+    if (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST) {
+        if (w & MK_OURS) w &= ~MK_OURS;
+        else if (m == WM_MOUSEMOVE && pad_mode && !*ctl_path) { // the real mouse: hand the cursor back once it moves
+            static LPARAM last;
+            if (last && l != last) pad_mode = 0, LOG("mouse moved: cursor back to the mouse");
+            last = l;
+        }
+    }
     return CallWindowProcA(game_proc, h, m, w, l);
+}
+
+static LONG (WINAPI *real_SetWindowLongA)(HWND, int, LONG);
+static LONG WINAPI h_SetWindowLongA(HWND h, int i, LONG v) {
+    if (h == game && i == GWL_WNDPROC && game_proc) { // menus <-> world: the game's procedure goes behind ours
+        LONG old = (LONG)game_proc;
+        return game_proc = (WNDPROC)v, old;
+    }
+    return real_SetWindowLongA(h, i, v);
 }
 
 static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int w, int h,
@@ -1033,6 +1118,11 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD st
         game = r;
         patch_engine();
         game_proc = (WNDPROC)SetWindowLongA(r, GWL_WNDPROC, (LONG)game_wndproc);
+        real_SetWindowLongA = (void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetWindowLongA");
+        DWORD old;
+        VirtualProtect((void *)0xa23fb4, 4, PAGE_READWRITE, &old);
+        *(void **)0xa23fb4 = h_SetWindowLongA;
+        VirtualProtect((void *)0xa23fb4, 4, old, &old);
         CreateThread(NULL, 0, tick_thread, NULL, 0, NULL);
     }
     return r;
