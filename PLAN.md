@@ -35,7 +35,7 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 ## Test rig
 
 - Steamless-unpacked exe in `sandbox/` (symlinks to the real install's data), own `WINEPREFIX=prefix/`.
-- Windowed, muted, no intro movies. Launched with `hyprctl dispatch exec "[workspace 5 silent]"`.
+- Windowed, no intro movies. Game audio is never muted or rerouted (that broke system audio once). Launched with `hyprctl dispatch exec "[workspace 5 silent]"`.
 - Pad input is simulated via a control file the DLL polls (`SACREDPAD_CTL`); no uinput devices.
 - Verification is done through DLL-side screenshots and a state dump.
 
