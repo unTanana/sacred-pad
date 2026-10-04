@@ -1,8 +1,10 @@
 // sacredpad: gamepad support for Sacred Gold (Steam build 2.0.2.28).
 // Loaded by the game as ijl15.dll (the real one is renamed ijl15_real.dll; exports forwarded via ijl15.def).
 // Pad input becomes a virtual mouse/keyboard inside the game process; the real cursor is never moved.
+#define COBJMACROS
 #include <windows.h>
 #include <windowsx.h>
+#include <ddraw.h>
 #include <xinput.h>
 #include <math.h>
 #include <stdio.h>
@@ -12,6 +14,36 @@ static FILE *logfile;
 static DWORD t0;
 #define LOG(...) (logfile && (fprintf(logfile, "%7.3f ", (GetTickCount() - t0) / 1000.0), fprintf(logfile, __VA_ARGS__), \
                               fputc('\n', logfile), fflush(logfile)))
+
+// ---------------------------------------------------------------- settings (sacredpad.ini next to the game)
+static struct { int deadzone, cursor_speed, target_range, hints, d2r_loot, manual_aim_ms; } cfg = {24, 12, 480, 1, 0, 2000};
+static const char default_ini[] =
+    "; sacredpad settings. Delete this file to get the defaults back.\n"
+    "[sacredpad]\n"
+    "; Stick dead zone, percent (5-50)\n"
+    "deadzone=24\n"
+    "; Cursor speed in menus and for manual aiming (1-30)\n"
+    "cursor_speed=12\n"
+    "; How far auto-targeting looks, in screen pixels (200-700)\n"
+    "target_range=480\n"
+    "; Button icons on the HUD, above targets and in menus (0 = off)\n"
+    "hints=1\n"
+    "; 0 = A attacks/talks/opens and LB+A picks up loot; 1 = D2R style, A also picks up loot\n"
+    "d2r_loot=0\n"
+    "; After using the right stick as a cursor, auto-targeting comes back after this many milliseconds\n"
+    "manual_aim_ms=2000\n";
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static void load_settings(void) {
+    const char *f = ".\\sacredpad.ini";
+    FILE *o;
+    if (GetFileAttributesA(f) == INVALID_FILE_ATTRIBUTES && (o = fopen(f, "w"))) fputs(default_ini, o), fclose(o);
+    cfg.deadzone = clampi(GetPrivateProfileIntA("sacredpad", "deadzone", cfg.deadzone, f), 5, 50);
+    cfg.cursor_speed = clampi(GetPrivateProfileIntA("sacredpad", "cursor_speed", cfg.cursor_speed, f), 1, 30);
+    cfg.target_range = clampi(GetPrivateProfileIntA("sacredpad", "target_range", cfg.target_range, f), 200, 700);
+    cfg.hints = GetPrivateProfileIntA("sacredpad", "hints", cfg.hints, f) != 0;
+    cfg.d2r_loot = GetPrivateProfileIntA("sacredpad", "d2r_loot", cfg.d2r_loot, f) != 0;
+    cfg.manual_aim_ms = clampi(GetPrivateProfileIntA("sacredpad", "manual_aim_ms", cfg.manual_aim_ms, f), 0, 30000);
+}
 
 // ---------------------------------------------------------------- pad
 typedef struct { float lx, ly, rx, ry, lt, rt; WORD btn; } Pad; // sticks -1..1 (y up), triggers 0..1
@@ -24,6 +56,10 @@ static volatile int ctl_far;           // test mode: FAR lifts the target radius
 static volatile int ctl_key;           // test mode: KEY=<vk> taps a key once
 static volatile int ctl_uidump;        // test mode: UIDUMP logs the visible UI tree
 static volatile unsigned target, locked; // soft target; R3 lock
+static volatile unsigned mount_ref;         // the horse the hero rides (hero +0x1ec), 0 on foot
+static volatile int hero_level;             // hero +0x3fe: decides how many HUD slots are unlocked
+static volatile int aiming;                 // an art button is held and the right stick places a ground marker
+static volatile POINT reticle;
 
 static const struct { const char *name; WORD bit; } btn_names[] = {
     {"UP", XINPUT_GAMEPAD_DPAD_UP}, {"DOWN", XINPUT_GAMEPAD_DPAD_DOWN}, {"LEFT", XINPUT_GAMEPAD_DPAD_LEFT},
@@ -81,13 +117,19 @@ static void read_pad(void) {
         XINPUT_GAMEPAD *g = &s.Gamepad;
         pad = (Pad){g->sThumbLX / 32767.f, g->sThumbLY / 32767.f, g->sThumbRX / 32767.f, g->sThumbRY / 32767.f,
                     g->bLeftTrigger / 255.f, g->bRightTrigger / 255.f, g->wButtons};
-        deadzone(&pad.lx, &pad.ly, 0.24f);
-        deadzone(&pad.rx, &pad.ry, 0.24f);
+        deadzone(&pad.lx, &pad.ly, cfg.deadzone / 100.f);
+        deadzone(&pad.rx, &pad.ry, cfg.deadzone / 100.f);
         if (pad.lt < 0.1f) pad.lt = 0;
         if (pad.rt < 0.1f) pad.rt = 0;
         return;
     }
 }
+
+#define BTN_LT 0x0400 // spare XInput bits: triggers as buttons
+#define BTN_RT 0x0800
+enum { A = XINPUT_GAMEPAD_A, B = XINPUT_GAMEPAD_B, X = XINPUT_GAMEPAD_X, Y = XINPUT_GAMEPAD_Y,
+       LB = XINPUT_GAMEPAD_LEFT_SHOULDER, RB = XINPUT_GAMEPAD_RIGHT_SHOULDER, L3 = XINPUT_GAMEPAD_LEFT_THUMB,
+       R3 = XINPUT_GAMEPAD_RIGHT_THUMB };
 
 #define DOWN(b) ((pad.btn & (b)) != 0)
 #define PRESSED(b) (DOWN(b) && !(prev.btn & (b)))
@@ -189,6 +231,7 @@ static int classify(Obj *h, Obj *o) {
     int f = family(o->type);
     if (f == 2 || f == 3 || f == 0x20) {
         if (can_attack(h, 0, o)) return T_ENEMY;
+        if (*(int *)((BYTE *)o + 0x1f0) == 4) return (unsigned)o->ref == mount_ref ? T_NONE : T_OBJECT; // horse: mount it
         return o->ref >= 0x11 && has_dialog(o) > 0 ? T_NPC : T_NONE;
     }
     if (is_item_type(TYPES, 0, o->type)) return T_ITEM;
@@ -272,6 +315,7 @@ static void update_targets(void *view) {
     if (d) LOG("ut: g0=%d,%d Ji=%f %f %f %f", g0.x, g0.y, Ji[0], Ji[1], Ji[2], Ji[3]);
     POINT hp = to_screen(h->x, h->y);
     hero_pos = hp;
+    mount_ref = *(unsigned *)((BYTE *)h + 0x1ec), hero_level = *(WORD *)((BYTE *)h + 0x3fe);
     unsigned n, best_ref = 0;
     Obj **t = objs(&n);
     float best = 1e9f;
@@ -281,11 +325,11 @@ static void update_targets(void *view) {
         if (!o || o == h || !o->sector) continue; // sector 0: carried
         POINT s = to_screen(o->x, o->y);
         float dx = s.x - hp.x, dy = s.y - hp.y, d = hypotf(dx, dy);
-        if (!ctl_far && (d > 480 || s.x < 8 || s.x > 1015 || s.y < 8 || s.y > 760)) continue; // on screen
+        if (!ctl_far && (d > cfg.target_range || s.x < 8 || s.x > 1015 || s.y < 8 || s.y > 760)) continue; // on screen
         int k = classify(h, o);
-        if (!k || loot_mode != (k == T_ITEM)) continue;
+        if (!k || (loot_mode && k != T_ITEM) || (!loot_mode && k == T_ITEM && !cfg.d2r_loot)) continue;
         float c = d > 1 ? (dx * aim_x + dy * aim_y) / d : 1;
-        float score = d + 220 * (1 - c) + (k == T_ENEMY ? 0 : 400); // cone toward the stick; enemies first
+        float score = d + 220 * (1 - c) + (k == T_ENEMY ? 0 : k == T_ITEM && !loot_mode ? 600 : 400); // cone toward the stick; enemies first
         if (r == target) score = holding ? -1 : score * 0.75f;      // sticky; fixed while acting
         if (r == locked) score = -2;
         if (score < best) best = score, best_ref = r, best_pos = s, target_kind = k;
@@ -304,11 +348,16 @@ static void update_targets(void *view) {
     if (ctl_dump) {
         ctl_dump = 0;
         LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked);
+        POINT at = to_screen(*(int *)((BYTE *)h + 0x108), *(int *)((BYTE *)h + 0x10c));
+        LOG("dump: hero action=%d target=%u at screen %ld,%ld level=%d mount=%u", *(short *)((BYTE *)h + 0xfc),
+            *(unsigned *)((BYTE *)h + 0x100), at.x, at.y, hero_level, mount_ref);
         for (unsigned r = 1; r < n; r++) {
             Obj *o = t[r];
             if (!o || o == h || !o->sector) continue;
             POINT s = to_screen(o->x, o->y);
             int k = classify(h, o);
+            if (family(o->type) == 2 || family(o->type) == 3 || family(o->type) == 0x20)
+                if (*(int *)((BYTE *)o + 0x1f0) == 4) LOG("dump horse ref=%u screen=%ld,%ld rider=%u", r, s.x, s.y, *(unsigned *)((BYTE *)o + 0x1ec));
             if (k == T_ENEMY || (k && abs(s.x - hp.x) < 4000 && abs(s.y - hp.y) < 4000))
                 LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0);
         }
@@ -347,7 +396,9 @@ static void snapshot_ui(void) {
         Ctl **end, **d = dialogs(m, &end);
         for (; d && d < end; d++) {
             add_window(*d, 0);
-            if (ctl_ok(*d) && ((*d)->flags & 1) && (*d)->vt == (void **)0x896b3c) { // NPC text: OK is drawn bottom centre
+            // NPC text (a big cUI_Tooltip; small ones are hover tooltips): its OK is drawn bottom centre
+            if (ctl_ok(*d) && ((*d)->flags & 1) && (*d)->vt == (void **)0x896b3c && (*d)->w >= 300 && (*d)->h >= 100 &&
+                (!dlg || (*d)->w * (*d)->h > ((Ctl *)dlg)->w * ((Ctl *)dlg)->h)) {
                 POINT p = ctl_pos(*d);
                 ui.ok = (POINT){p.x + (*d)->w / 2, p.y + (*d)->h - 19}, dlg = *d;
             }
@@ -409,9 +460,168 @@ static void patch_jmp(DWORD at, void *fn) {
     VirtualProtect(p, 5, old, &old);
 }
 
+// ---------------------------------------------------------------- overlay: button icons and the aim marker
+// Glyphs are painted once with GDI into small colour-keyed DirectDraw surfaces, then blitted onto the back
+// buffer right before the game flips (cDxDriver7 0x645e40: +0xb4 IDirectDraw7, +0xbc back buffer).
+enum { G_A, G_B, G_X, G_Y, G_LB, G_RB, G_LT, G_RT, G_UP, G_DOWN, G_LEFT, G_RIGHT, G_RING, G_LOCK,
+       G_MENU_LEGEND, G_WORLD_MENU_LEGEND, G_N };
+static IDirectDrawSurface7 *glyph[G_N], *glyph_back;
+static SIZE gsize[G_N];
+
+static void paint_button(HDC dc, int x, int y, int g) { // one button icon with its top-left at x, y
+    static const COLORREF face[] = {RGB(60, 176, 67), RGB(214, 56, 46), RGB(47, 120, 222), RGB(240, 192, 0)};
+    static const char *label[] = {"A", "B", "X", "Y", "LB", "RB", "LT", "RT"};
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(20, 20, 20)), op = SelectObject(dc, pen);
+    HFONT font = CreateFontA(g < G_LB ? -15 : -11, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Tahoma");
+    HFONT of = SelectObject(dc, font);
+    HBRUSH br = CreateSolidBrush(g < G_LB ? face[g] : RGB(70, 70, 76)), ob = SelectObject(dc, br);
+    RECT r;
+    if (g < G_LB) Ellipse(dc, x + 1, y + 1, x + 23, y + 23), r = (RECT){x, y + 1, x + 24, y + 24};
+    else if (g < G_UP) RoundRect(dc, x + 1, y + 1, x + 29, y + 21, 8, 8), r = (RECT){x, y + 1, x + 30, y + 22};
+    else {
+        Ellipse(dc, x + 1, y + 1, x + 21, y + 21);
+        SelectObject(dc, GetStockObject(WHITE_BRUSH));
+        static const POINT tri[4][3] = {{{11, 5}, {5, 14}, {17, 14}}, {{11, 16}, {5, 7}, {17, 7}},
+                                        {{5, 11}, {14, 5}, {14, 17}}, {{17, 11}, {8, 5}, {8, 17}}};
+        POINT t[3];
+        for (int i = 0; i < 3; i++) t[i] = (POINT){x + tri[g - G_UP][i].x - 1, y + tri[g - G_UP][i].y - 1};
+        Polygon(dc, t, 3);
+    }
+    if (g < G_UP) {
+        SetBkMode(dc, TRANSPARENT), SetTextColor(dc, g == G_Y ? RGB(30, 30, 30) : RGB(255, 255, 255));
+        DrawTextA(dc, label[g], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, op), SelectObject(dc, of), SelectObject(dc, ob);
+    DeleteObject(pen), DeleteObject(font), DeleteObject(br);
+}
+
+static int legend_width(HDC dc, const int *gl, const char *const *txt, int n, int paint) {
+    HFONT font = CreateFontA(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Tahoma");
+    int x = 4;
+    for (int i = 0; i < n; i++) {
+        if (paint) paint_button(dc, x, gl[i] < G_LB ? 3 : 5, gl[i]);
+        x += gl[i] < G_LB ? 26 : gl[i] < G_UP ? 32 : 24;
+        HFONT of = SelectObject(dc, font);
+        SIZE sz;
+        GetTextExtentPoint32A(dc, txt[i], strlen(txt[i]), &sz);
+        if (paint) {
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(10, 10, 10)), TextOutA(dc, x + 1, 7, txt[i], strlen(txt[i])); // shadow
+            SetTextColor(dc, RGB(235, 225, 200)), TextOutA(dc, x, 6, txt[i], strlen(txt[i]));
+        }
+        SelectObject(dc, of);
+        x += sz.cx + 14;
+    }
+    DeleteObject(font);
+    return x;
+}
+
+static void paint_glyph(HDC dc, int g, int w, int h) {
+    static const int menu_g[] = {G_A, G_X, G_B, G_LB};
+    static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"};
+    static const int world_g[] = {G_A, G_X, G_B};
+    static const char *const world_t[] = {"Select", "Use", "Back"};
+    if (g == G_RING || g == G_LOCK) {
+        COLORREF c = g == G_RING ? RGB(255, 214, 90) : RGB(230, 60, 50);
+        HPEN pen = CreatePen(PS_SOLID, 3, c), op = SelectObject(dc, pen);
+        HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, 2, 2 + h / 4, w - 2, h - 2 - h / 4); // flat ellipse: a circle on the isometric ground
+        if (g == G_RING) MoveToEx(dc, w / 2 - 6, h / 2, 0), LineTo(dc, w / 2 + 7, h / 2), MoveToEx(dc, w / 2, h / 2 - 5, 0), LineTo(dc, w / 2, h / 2 + 6);
+        SelectObject(dc, op), SelectObject(dc, ob), DeleteObject(pen);
+    } else if (g == G_MENU_LEGEND) legend_width(dc, menu_g, menu_t, 4, 1);
+    else if (g == G_WORLD_MENU_LEGEND) legend_width(dc, world_g, world_t, 3, 1);
+    else paint_button(dc, 0, 0, g);
+}
+
+static void free_glyphs(void) {
+    for (int i = 0; i < G_N; i++)
+        if (glyph[i]) IDirectDrawSurface7_Release(glyph[i]), glyph[i] = NULL;
+}
+
+static int make_glyphs(IDirectDraw7 *dd, IDirectDrawSurface7 *back) {
+    DDPIXELFORMAT pf = {sizeof pf};
+    if (IDirectDrawSurface7_GetPixelFormat(back, &pf)) return 0;
+    HDC sdc = GetDC(NULL);
+    for (int g = 0; g < G_N; g++) {
+        SIZE sz = g < G_LB ? (SIZE){24, 24} : g < G_UP ? (SIZE){30, 22} : g < G_RING ? (SIZE){22, 22}
+                : g <= G_LOCK ? (SIZE){g == G_RING ? 64 : 52, g == G_RING ? 64 : 52} : (SIZE){0, 30};
+        if (!sz.cx) { // legends: measure the text first
+            static const int menu_g[] = {G_A, G_X, G_B, G_LB}, world_g[] = {G_A, G_X, G_B};
+            static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"}, *const world_t[] = {"Select", "Use", "Back"};
+            sz.cx = g == G_MENU_LEGEND ? legend_width(sdc, menu_g, menu_t, 4, 0) : legend_width(sdc, world_g, world_t, 3, 0);
+        }
+        DDSURFACEDESC2 d = {sizeof d};
+        d.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+        d.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY;
+        d.dwWidth = sz.cx, d.dwHeight = sz.cy, d.ddpfPixelFormat = pf;
+        if (IDirectDraw7_CreateSurface(dd, &d, &glyph[g], NULL)) { LOG("overlay: CreateSurface failed"); break; }
+        HDC dc;
+        if (!IDirectDrawSurface7_GetDC(glyph[g], &dc)) {
+            RECT all = {0, 0, sz.cx, sz.cy};
+            HBRUSH key = CreateSolidBrush(RGB(255, 0, 255));
+            FillRect(dc, &all, key), DeleteObject(key);
+            paint_glyph(dc, g, sz.cx, sz.cy);
+            IDirectDrawSurface7_ReleaseDC(glyph[g], dc);
+        }
+        DWORD k = pf.dwRBitMask | pf.dwBBitMask; // magenta in any RGB format
+        DDCOLORKEY ck = {k, k};
+        IDirectDrawSurface7_SetColorKey(glyph[g], DDCKEY_SRCBLT, &ck);
+        gsize[g] = sz;
+    }
+    ReleaseDC(NULL, sdc);
+    if (!glyph[G_N - 1]) return free_glyphs(), 0;
+    LOG("overlay: glyphs ready (%lu bpp)", pf.dwRGBBitCount);
+    return 1;
+}
+
+static void put(IDirectDrawSurface7 *back, int g, int cx, int cy) { // centred on cx, cy, clipped to the screen
+    RECT src = {0, 0, gsize[g].cx, gsize[g].cy};
+    int x = cx - gsize[g].cx / 2, y = cy - gsize[g].cy / 2;
+    if (x < 0) src.left -= x, x = 0;
+    if (y < 0) src.top -= y, y = 0;
+    if (x + src.right - src.left > 1024) src.right = src.left + 1024 - x;
+    if (y + src.bottom - src.top > 768) src.bottom = src.top + 768 - y;
+    if (src.right <= src.left || src.bottom <= src.top) return;
+    if (IDirectDrawSurface7_BltFast(back, x, y, glyph[g], &src, DDBLTFAST_SRCCOLORKEY | DDBLTFAST_WAIT) == DDERR_SURFACELOST)
+        free_glyphs(); // a mode switch: rebuild next frame
+}
+
+// HUD geometry (1024x768): art slots 6..0 grow right from x=670, weapon slots 1..n end at x=362; one slot more at
+// levels 2, 8, 16 and 30. Potions sit on the compass at the top of the HUD.
+static void draw_overlay(BYTE *drv) {
+    static volatile LONG busy;
+    IDirectDraw7 *dd = *(IDirectDraw7 **)(drv + 0xb4);
+    IDirectDrawSurface7 *back = *(IDirectDrawSurface7 **)(drv + 0xbc);
+    if (!dd || !back || InterlockedExchange(&busy, 1)) return;
+    if (back != glyph_back) free_glyphs(), glyph_back = back;
+    if (!glyph[0] && !make_glyphs(dd, back)) { busy = 0; return; }
+    int lt = DOWN(BTN_LT), world = hero() && !ui.open;
+    if (aiming) put(back, G_RING, reticle.x, reticle.y);
+    if (cfg.hints && pad_mode) {
+        if (world) {
+            int lvl = hero_level, n = 1 + (lvl >= 2) + (lvl >= 8) + (lvl >= 16) + (lvl >= 30);
+            static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT};
+            for (int i = 0; i < n; i++) put(back, art_g[i], lt ? 362 - (n - 1 - i) * 67 : 670 + i * 67, 690);
+            put(back, G_LT, 362 - n * 67 + 12, 712);
+            put(back, G_UP, lt ? 513 : 452, 652), put(back, G_RIGHT, 483, 652), put(back, G_LEFT, 545, 652), put(back, G_DOWN, 576, 652);
+            if (target && !cursor_mode && !aiming) {
+                int above = target_kind == T_ENEMY || target_kind == T_NPC ? 85 : 30;
+                put(back, G_A, target_pos.x, target_pos.y - above);
+            }
+            if (locked && target == locked) put(back, G_LOCK, target_pos.x, target_pos.y);
+        } else put(back, hero() ? G_MENU_LEGEND : G_WORLD_MENU_LEGEND, 12 + gsize[hero() ? G_MENU_LEGEND : G_WORLD_MENU_LEGEND].cx / 2, hero() ? 20 : 748);
+    }
+    busy = 0;
+}
+
+static void (__fastcall *flip)(void *) = (void *)0x645e40;
+static void __fastcall h_flip(void *drv) { draw_overlay(drv), flip(drv); }
+
 static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e. once the window exists
     patch_call(0x64490d, h_device_setup);
     if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_jmp(0x6a0d80, h_movie_open);
+    patch_call(0x60ea8a, h_flip);        // world frame present
+    patch_call(0x757250, h_flip);        // menu-thread present (main menu)
     patch_call(0x60e9c7, h_cursor_pass); // engine frame loop
     patch_call(0x60ea01, h_cursor_pass);
     patch_call(0x611f64, h_pick_hover);  // hover inside the cursor pass
@@ -420,11 +630,6 @@ static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e
 }
 
 // ---------------------------------------------------------------- per-frame logic (input thread)
-#define BTN_LT 0x0400 // spare XInput bits: triggers as buttons
-#define BTN_RT 0x0800
-enum { A = XINPUT_GAMEPAD_A, B = XINPUT_GAMEPAD_B, X = XINPUT_GAMEPAD_X, Y = XINPUT_GAMEPAD_Y,
-       LB = XINPUT_GAMEPAD_LEFT_SHOULDER, RB = XINPUT_GAMEPAD_RIGHT_SHOULDER, L3 = XINPUT_GAMEPAD_LEFT_THUMB,
-       R3 = XINPUT_GAMEPAD_RIGHT_THUMB };
 
 static void tap(int k) { key(k, 1), key(k, 0); }
 
@@ -490,7 +695,8 @@ static void update_menu(int entered) {
     float lx = pad.lx + pad.rx, ly = pad.ly + pad.ry, m = fminf(hypotf(lx, ly), 1);
     if (m > 0) {
         if (!fx && !fy) fx = vcur.x, fy = vcur.y;
-        fx += lx * (1.5f + 10 * m), fy -= ly * (1.5f + 10 * m); // slow near the centre for precise aiming
+        float v = (1.5f + 10 * m) * cfg.cursor_speed / 12.f; // slow near the centre for precise aiming
+        fx += lx * v, fy -= ly * v;
         move_cursor(lroundf(fx), lroundf(fy));
     }
     fx = vcur.x, fy = vcur.y;
@@ -538,8 +744,30 @@ static void update(void) {
     if (m > 0.2f) aim_x = pad.lx / m, aim_y = -pad.ly / m, cursor_mode = 0;
     loot_mode = DOWN(LB);
 
+    static const WORD slot_btn[] = {X, Y, B, RB, BTN_RT};
+    int art = 0;
+    for (int i = 0; i < 5; i++) {
+        if (PRESSED(slot_btn[i])) tap(lt ? '1' + i : "67890"[i]); // select slot; with LT: weapon slot 1..5
+        if (DOWN(slot_btn[i]) && !lt) art = 1;
+    }
+
+    // Hold-to-aim: an art button held while the right stick is pushed puts a marker on the ground instead of
+    // casting; releasing the art button casts there. Without the right stick, holding keeps casting at the target.
+    static int cast_pulse;
+    float rm = hypotf(pad.rx, pad.ry);
+    if (art && (aiming || rm > 0.35f)) {
+        if (!aiming) aiming = 1, key(VK_RBUTTON, 0);
+        if (rm > 0.1f) reticle = (POINT){hero_pos.x + lroundf(pad.rx * 300), hero_pos.y - lroundf(pad.ry * 225)};
+        cursor_toward(reticle), force = -1; // the game's own hover shows what is under the marker
+    } else if (aiming) { // released: cast at the marker, on whatever stands there
+        aiming = 0;
+        cursor_toward(reticle), force = -1, key(VK_RBUTTON, 1), cast_pulse = 4;
+    }
+    if (cast_pulse && !--cast_pulse) key(VK_RBUTTON, 0);
+    int casting = art && !aiming;
+
     // LT + right stick up/down: zoom (the mouse wheel). Otherwise the right stick is a free cursor
-    // (manual aim), back to auto-targeting 2 s after it rests.
+    // (manual aim), back to auto-targeting a while after it rests.
     static int wheel_wait;
     if (lt && fabsf(pad.ry) > 0.5f) {
         if (--wheel_wait <= 0) {
@@ -548,23 +776,29 @@ static void update(void) {
             PostMessageA(game, WM_MOUSEWHEEL, MAKEWPARAM(mk(), pad.ry > 0 ? WHEEL_DELTA : -WHEEL_DELTA), MAKELPARAM(p.x, p.y));
             wheel_wait = 15;
         }
-    } else if (pad.rx || pad.ry) {
+    } else if ((pad.rx || pad.ry) && !art && !aiming && !cast_pulse) {
         cursor_mode = 1, cursor_idle = 0;
-        move_cursor(vcur.x + lroundf(pad.rx * 14), vcur.y - lroundf(pad.ry * 14));
-    } else if (cursor_mode && ++cursor_idle > 250) cursor_mode = 0;
+        move_cursor(vcur.x + lroundf(pad.rx * (cfg.cursor_speed + 2)), vcur.y - lroundf(pad.ry * (cfg.cursor_speed + 2)));
+    } else if (cursor_mode && ++cursor_idle > cfg.manual_aim_ms / 8) cursor_mode = 0;
 
-    static const WORD slot_btn[] = {X, Y, B, RB, BTN_RT};
-    int art = 0;
-    for (int i = 0; i < 5; i++) {
-        if (PRESSED(slot_btn[i])) tap(lt ? '1' + i : "67890"[i]); // select slot; with LT: weapon slot 1..5
-        if (DOWN(slot_btn[i]) && !lt) art = 1;
+    // LT + A on horseback: dismount (the game's Shift+click on the horse).
+    static int dismount;
+    if (lt && PRESSED(A) && mount_ref && !dismount) dismount = 1;
+    if (dismount) {
+        if (walking) key(VK_LBUTTON, 0), walking = 0;
+        walk_only = 0;
+        if (dismount == 1) key(VK_SHIFT, 1), force = mount_ref, move_cursor(hero_pos.x, hero_pos.y - 30), key(VK_LBUTTON, 1);
+        if (dismount == 3) key(VK_LBUTTON, 0);
+        if (++dismount > 12) key(VK_SHIFT, 0), force = -1, dismount = 0;
+        return;
     }
-    int act = DOWN(A) && !(DOWN(LB) && !target); // LB+A with no item in reach: collect everything
+
+    int act = DOWN(A) && !(lt && mount_ref) && !(DOWN(LB) && !target); // LB+A with no item in reach: collect all
     if (DOWN(LB) && PRESSED(A) && !target) tap('A');
 
     // Left stick walks (the game's click-and-hold walking toward a point ahead of the hero),
     // unless an action is held: then it only steers the aim, like D2R.
-    if (m > 0.2f && !act && !art) {
+    if (m > 0.2f && !act && !art && !cast_pulse) {
         move_cursor(hero_pos.x + lroundf(aim_x * 160), hero_pos.y + lroundf(aim_y * 120));
         walk_only = 1, key(VK_LBUTTON, 1), walking = 1;
     } else if (walking) {
@@ -572,15 +806,16 @@ static void update(void) {
     }
 
     // A: left click on the target (attack / talk / open / pick up); X Y B RB RT: right click with the selected art.
-    holding = act || art;
-    if (act || art) {
+    holding = act || casting;
+    if (act || casting) {
         aim_action();
         if (!acting) acting = 1; // first frame: cursor placed above, buttons below
         key(VK_LBUTTON, act);
-        key(VK_RBUTTON, art);
+        key(VK_RBUTTON, casting);
     } else if (acting) {
-        key(VK_LBUTTON, 0), key(VK_RBUTTON, 0);
-        if (++acting > 12) acting = 0, force = -1; // keep the forced pick until the game has seen the release
+        key(VK_LBUTTON, 0);
+        if (!cast_pulse) key(VK_RBUTTON, 0);
+        if (++acting > 12) acting = 0, force = cast_pulse ? force : -1; // keep the forced pick until the game has seen the release
     }
 
     if (PRESSED(R3)) locked = locked ? 0 : target;
@@ -696,6 +931,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res) {
     if (reason == DLL_PROCESS_DETACH) LOG("process exit%s", res ? " (terminating)" : "");
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
     t0 = GetTickCount();
+    load_settings();
     AddVectoredExceptionHandler(1, crash_log);
     DisableThreadLibraryCalls(inst);
     logfile = fopen("sacredpad.log", "w");
