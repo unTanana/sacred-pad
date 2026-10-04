@@ -9,7 +9,9 @@
 #include <string.h>
 
 static FILE *logfile;
-#define LOG(...) (logfile && (fprintf(logfile, __VA_ARGS__), fputc('\n', logfile), fflush(logfile)))
+static DWORD t0;
+#define LOG(...) (logfile && (fprintf(logfile, "%7.3f ", (GetTickCount() - t0) / 1000.0), fprintf(logfile, __VA_ARGS__), \
+                              fputc('\n', logfile), fflush(logfile)))
 
 // ---------------------------------------------------------------- pad
 typedef struct { float lx, ly, rx, ry, lt, rt; WORD btn; } Pad; // sticks -1..1 (y up), triggers 0..1
@@ -216,17 +218,36 @@ static POINT to_screen(int x, int y) {
 #define UIMGR (*(BYTE **)0x17eebbc) // +0x80..+0xd8: one window pointer per UI_WND_*
 typedef struct Ctl { void **vt; int _4, _8, _c, flags, _14[4]; int x, y; short w, h; char name[32]; struct Ctl *parent;
                      BYTE _54[0x24]; struct Ctl **kids, **kids_end; } Ctl; // cUI_Control2 / cUI_Window2 prefix
+// UI pointers are walked from the engine thread while the game builds and tears windows down, and +0x78 is
+// only a child list on some window classes: validate everything before following it.
+static int ctl_ok(Ctl *c) {
+    return (DWORD)c > 0x10000 && !((DWORD)c & 3) && !IsBadReadPtr(c, sizeof *c) &&
+           (DWORD)c->vt >= 0x88f000 && (DWORD)c->vt < 0x8e7000; // a vtable in the game's .rdata
+}
+static Ctl **kids(Ctl *c, Ctl ***end) {
+    *end = c->kids_end;
+    if (!c->kids || c->kids_end <= c->kids || c->kids_end - c->kids > 256 || ((DWORD)c->kids & 3) ||
+        IsBadReadPtr(c->kids, (c->kids_end - c->kids) * sizeof *c->kids))
+        return *end = NULL;
+    return c->kids;
+}
+static Ctl **dialogs(BYTE *m, Ctl ***end) { // cUI_Manager's [+0x124, +0x128) list of open dialogs
+    Ctl **b = *(Ctl ***)(m + 0x124);
+    *end = *(Ctl ***)(m + 0x128);
+    if (!b || *end <= b || *end - b > 64 || IsBadReadPtr(b, (*end - b) * sizeof *b)) return *end = NULL;
+    return b;
+}
 static POINT ctl_pos(Ctl *c) { // absolute: x/y are relative to the parent
     POINT p = {0, 0};
-    for (int i = 0; c && i < 16; c = c->parent, i++) p.x += c->x, p.y += c->y;
+    for (int i = 0; ctl_ok(c) && i < 16; c = c->parent, i++) p.x += c->x, p.y += c->y;
     return p;
 }
 static void ui_dump(Ctl *c, int depth) {
-    if (!c || !(c->flags & 1) || depth > 6) return;
+    if (!ctl_ok(c) || !(c->flags & 1) || depth > 6) return;
     POINT p = ctl_pos(c);
     LOG("ui %*s%.32s vt=%p at %ld,%ld %dx%d flags=%x", depth * 2, "", c->name, (void *)c->vt, p.x, p.y, c->w, c->h, c->flags);
-    if (c->kids && c->kids_end > c->kids && c->kids_end - c->kids < 512)
-        for (Ctl **k = c->kids; k < c->kids_end; k++) ui_dump(*k, depth + 1);
+    Ctl **end, **k = kids(c, &end);
+    for (; k && k < end; k++) ui_dump(*k, depth + 1);
 }
 
 // ---------------------------------------------------------------- targeting (runs on the engine thread, per frame)
@@ -277,7 +298,8 @@ static void update_targets(void *view) {
             Ctl *w = ((Ctl **)(UIMGR + 0x80))[i];
             LOG("uiw %d %.32s vt=%p vis=%d", i, w ? w->name : "-", w ? (void *)w->vt : 0, w ? w->flags & 1 : 0);
         }
-        for (Ctl **w = *(Ctl ***)(UIMGR + 0x124); w && w < *(Ctl ***)(UIMGR + 0x128); w++) ui_dump(*w, 0);
+        Ctl **end, **w = dialogs(UIMGR, &end);
+        for (; w && w < end; w++) ui_dump(*w, 0);
     }
     if (ctl_dump) {
         ctl_dump = 0;
@@ -297,16 +319,16 @@ static void update_targets(void *view) {
 // Snapshot of the open panels/dialogs, taken on the engine thread (the input thread never walks UI pointers).
 static struct { volatile int open, nwin, nbtn; RECT win[24]; int grid[24]; POINT btn[64]; volatile void *dlg; POINT ok; } ui;
 static void collect_buttons(Ctl *c, int depth) {
-    if (!c || !(c->flags & 1) || depth > 6) return;
+    if (!ctl_ok(c) || !(c->flags & 1) || depth > 6) return;
     if ((c->vt == (void **)0x897308 || c->vt == (void **)0x89733c) && ui.nbtn < 64) { // cUI_Button2 / RadioButton2
         POINT p = ctl_pos(c);
         ui.btn[ui.nbtn++] = (POINT){p.x + c->w / 2, p.y + c->h / 2};
     }
-    if (c->kids && c->kids_end > c->kids && c->kids_end - c->kids < 512)
-        for (Ctl **k = c->kids; k < c->kids_end; k++) collect_buttons(*k, depth + 1);
+    Ctl **end, **k = kids(c, &end);
+    for (; k && k < end; k++) collect_buttons(*k, depth + 1);
 }
 static void add_window(Ctl *w, int grid) {
-    if (!w || !(w->flags & 1) || ui.nwin >= 24) return;
+    if (!ctl_ok(w) || !(w->flags & 1) || ui.nwin >= 24) return;
     POINT p = ctl_pos(w);
     ui.grid[ui.nwin] = grid;
     ui.win[ui.nwin++] = (RECT){p.x, p.y, p.x + w->w, p.y + w->h};
@@ -322,9 +344,10 @@ static void snapshot_ui(void) {
             if (i != 0 && i != 7 && i != 19)
                 add_window(w[i], i == 1 || i == 2 || i == 3 || i == 4 || i == 13 || i == 16 || i == 21 || i == 22);
         void *dlg = 0;
-        for (Ctl **d = *(Ctl ***)(m + 0x124); d && d < *(Ctl ***)(m + 0x128); d++) { // dialogs
+        Ctl **end, **d = dialogs(m, &end);
+        for (; d && d < end; d++) {
             add_window(*d, 0);
-            if (*d && ((*d)->flags & 1) && (*d)->vt == (void **)0x896b3c) { // NPC text: OK is drawn bottom centre
+            if (ctl_ok(*d) && ((*d)->flags & 1) && (*d)->vt == (void **)0x896b3c) { // NPC text: OK is drawn bottom centre
                 POINT p = ctl_pos(*d);
                 ui.ok = (POINT){p.x + (*d)->w / 2, p.y + (*d)->h - 19}, dlg = *d;
             }
@@ -638,8 +661,42 @@ static void *hook(const char *dll, const char *name, void *fn) {
     return real;
 }
 
+// Crash reports: the first few real faults (any thread, before the game's own handlers) with the module and
+// the game return addresses on the stack. Wine's own probes (IsBadReadPtr etc.) fault inside system DLLs: skipped.
+static LONG CALLBACK crash_log(EXCEPTION_POINTERS *e) {
+    static volatile LONG n;
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    CONTEXT *c = e->ContextRecord;
+    DWORD code = r->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    HMODULE m = 0;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           r->ExceptionAddress, &m))
+        GetModuleFileNameA(m, name, sizeof name);
+    char *base = strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name;
+    if (m != GetModuleHandleA(NULL) && m != GetModuleHandleA("ijl15.dll") && _stricmp(base, "ddraw.dll") &&
+        _stricmp(base, "amstream.dll") && _stricmp(base, "granny.dll") && _stricmp(base, "mss32.dll"))
+        return EXCEPTION_CONTINUE_SEARCH; // a probe inside a system DLL
+    if (InterlockedIncrement(&n) > 5) return EXCEPTION_CONTINUE_SEARCH;
+    LOG("FAULT %08lx at %p (%s+%lx) addr=%08lx eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx esp=%08lx ebp=%08lx",
+        code, r->ExceptionAddress, base, (DWORD)r->ExceptionAddress - (DWORD)m, r->NumberParameters > 1 ? r->ExceptionInformation[1] : 0,
+        c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp, c->Ebp);
+    DWORD *sp = (DWORD *)c->Esp;
+    char calls[256] = "", *o = calls;
+    for (int i = 0; i < 64 && o < calls + sizeof calls - 12 && !IsBadReadPtr(sp + i, 4); i++)
+        if (sp[i] > 0x401000 && sp[i] < 0x890000) o += sprintf(o, " %08lx", sp[i]); // game return addresses (likely)
+    LOG("  stack:%s  pad=%04x ui=%d hero_ok=%d", calls, pad.btn, ui.open, GetModuleHandleA(NULL) != 0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res) {
+    if (reason == DLL_PROCESS_DETACH) LOG("process exit%s", res ? " (terminating)" : "");
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    t0 = GetTickCount();
+    AddVectoredExceptionHandler(1, crash_log);
     DisableThreadLibraryCalls(inst);
     logfile = fopen("sacredpad.log", "w");
     char env[MAX_PATH];
