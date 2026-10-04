@@ -15,6 +15,23 @@ static DWORD t0;
 #define LOG(...) (logfile && (fprintf(logfile, "%7.3f ", (GetTickCount() - t0) / 1000.0), fprintf(logfile, __VA_ARGS__), \
                               fputc('\n', logfile), fflush(logfile)))
 
+// ---------------------------------------------------------------- code patching
+static void *patch_ptr(void *at, void *fn) { // a function pointer in a vtable, the IAT or a delay-load slot
+    DWORD old;
+    void *was = *(void **)at;
+    VirtualProtect(at, 4, PAGE_READWRITE, &old), *(void **)at = fn, VirtualProtect(at, 4, old, &old);
+    return was;
+}
+static void patch_rel(DWORD at, void *fn, BYTE op) { // a call (E8) or jmp (E9) at `at`
+    BYTE *p = (BYTE *)at;
+    DWORD old;
+    if (op == 0xE8 && *p != 0xE8) { LOG("patch: no call at %08lx", at); return; }
+    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    p[0] = op, *(DWORD *)(p + 1) = (DWORD)fn - (at + 5);
+    VirtualProtect(p, 5, old, &old);
+}
+#define patch_call(at, fn) patch_rel(at, fn, 0xE8)
+
 // ---------------------------------------------------------------- settings (sacredpad.ini next to the game)
 static struct { int deadzone, cursor_speed, target_range, hints, d2r_loot, manual_aim_ms; } cfg = {24, 12, 480, 1, 0, 2000};
 static const char default_ini[] =
@@ -56,8 +73,6 @@ static volatile int ctl_dump;          // test mode: DUMP logs the classified ob
 static volatile int ctl_far;           // test mode: FAR lifts the target radius / on-screen limit
 static volatile int ctl_uiscan;        // test mode: UISCAN logs controls found by scanning window memory
 static volatile int ctl_focus;         // test mode: FOCUS logs the focus list
-static volatile int rendlog;           // test mode: REND logs the next draws of clickable controls
-static volatile int ctl_trace;         // test mode: TRACE logs the target every frame for a while
 static volatile unsigned target, locked; // soft target; R3 lock
 static volatile unsigned mount_ref;         // the horse the hero rides (hero +0x1ec), 0 on foot
 static volatile int hero_level;             // hero +0x3fe: decides how many HUD slots are unlocked
@@ -105,8 +120,6 @@ static void read_pad(void) {
             if (!strcmp(t, "FAR")) ctl_far = 1;
             if (!strcmp(t, "UISCAN")) ctl_uiscan = 1;
             if (!strcmp(t, "FOCUS")) ctl_focus = 1;
-            if (!strcmp(t, "REND")) rendlog = 400;
-            if (!strcmp(t, "TRACE")) ctl_trace = 180;
         }
         if (f) fclose(f);
         return;
@@ -150,7 +163,6 @@ enum { A = XINPUT_GAMEPAD_A, B = XINPUT_GAMEPAD_B, X = XINPUT_GAMEPAD_X, Y = XIN
 // ---------------------------------------------------------------- virtual mouse/keyboard
 static HWND game;
 static WNDPROC game_proc;
-static LRESULT CALLBACK game_wndproc(HWND, UINT, WPARAM, LPARAM);
 static POINT vcur = {512, 384}; // client coords (game is 1024x768)
 static BYTE vk[256];            // 0x80 = held by the pad
 static int pad_mode;            // 1 = pad owns the cursor; real mouse movement switches back
@@ -381,7 +393,7 @@ static void update_targets(void *view) {
     if (locked && best_ref != locked) locked = 0; // lock lost (dead, gone, off screen)
     if (ctl_dump) {
         ctl_dump = 0;
-        LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u wndproc_ours=%d", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked, GetWindowLongA(game, GWL_WNDPROC) == (LONG)game_wndproc);
+        LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked);
         POINT at = to_screen(*(int *)((BYTE *)h + 0x108), *(int *)((BYTE *)h + 0x10c));
         LOG("dump: hero action=%d target=%u at screen %ld,%ld level=%d mount=%u", *(short *)((BYTE *)h + 0xfc),
             *(unsigned *)((BYTE *)h + 0x100), at.x, at.y, hero_level, mount_ref);
@@ -391,11 +403,10 @@ static void update_targets(void *view) {
             POINT s = to_screen(o->x, o->y);
             int k = classify(h, o);
             if (k == T_ENEMY || (k && abs(s.x - hp.x) < 4000 && abs(s.y - hp.y) < 4000))
-                LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d f2=%lx", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0, k == T_NPC ? *(DWORD *)((BYTE *)o + 0x200) : 0);
+                LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0);
         }
     }
     target = best_ref, target_pos = best_pos;
-    if (ctl_trace > 0) ctl_trace--, LOG("trace target=%u kind=%d at %ld,%ld best=%.0f mode=%d", best_ref, target_kind, best_pos.x, best_pos.y, best, pad_mode);
 }
 
 // ---------------------------------------------------------------- focus: what can be selected on screen
@@ -403,12 +414,14 @@ static void update_targets(void *view) {
 // list is exactly what is on screen: hidden pages, tabs and closed windows never draw. Item grids come from the
 // inventory data. The list is built on the render thread and published at each present.
 typedef struct { RECT r; int kind; } Focus;
-enum { F_CTL, F_ITEM, F_SLOT, F_CELL, F_ART }; // F_ART: a combat art or combo that can go on the hotbar
+enum { F_CTL, F_ITEM, F_ART }; // F_ITEM: an item in a grid (new screens start there); F_ART: can go on the hotbar
 #define MAXF 256
 static Focus fbuf[2][MAXF];
 static volatile int fpub, fcount[2]; // fbuf[fpub] is the published list, fbuf[!fpub] is being built
 static volatile int fmodal[2];       // the list belongs to a confirmation pop-up (focus starts afresh there)
 static volatile int carrying;        // an item hangs on the cursor (mouse +0x68)
+static volatile int legend_covered; // an open window reaches into the top-left corner where the menu legend goes
+static volatile POINT npc_ok;        // the only answer of an open NPC dialog (OK), for B; x < 0 when none
 static RECT focus;                   // current menu focus; empty = none
 static int free_cursor;              // the right stick took over in a menu
 static volatile int cursor_hidden;   // the pad drives: the game does not draw its cursor
@@ -430,8 +443,6 @@ static void (__fastcall *render_orig[16])(void *, void *, void *);
 static void __fastcall h_render(Ctl *c, void *edx, void *dev) {
     int i = 0;
     while (clickable[i].vt && clickable[i].vt != (DWORD)c->vt) i++;
-    if (rendlog > 0 && rendlog--) { Ctl *r = c; for (int k = 0; k < 16 && ctl_ok(r->parent); k++) r = r->parent;
-        POINT p = ctl_pos(c); LOG("rend %.24s vt=%p flags=%x cmd=%p at %ld,%ld %dx%d root=%.20s", c->name, (void *)c->vt, c->flags, clickable[i].cmd ? *(void **)((BYTE *)c + clickable[i].cmd) : 0, p.x, p.y, c->w, c->h, r->name); }
     if (clickable[i].vt && (c->flags & 5) == 5 && (!clickable[i].cmd || *(void **)((BYTE *)c + clickable[i].cmd))) {
         Ctl *root = c;
         for (int k = 0; k < 16 && ctl_ok(root->parent); k++) root = root->parent;
@@ -492,25 +503,14 @@ static void __fastcall h_busy_render(void *dlg, void *edx, void *dev) {
     if (((Ctl *)dlg)->flags & 1) modal_mark = fcount[!fpub]; // it is called every frame, visible or not
     busy_render(dlg, edx, dev);
 }
-static void hook_renders(void) {
-    void **slot = (void **)0x897134 + 5;
-    DWORD old;
-    VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_busy_render, VirtualProtect(slot, 4, old, &old);
-    static const struct { DWORD vt; void *fn; } own[] = {{0x897258, h_sheet_render}, {0x896610, h_spell_render}, {0x896578, h_combo_render}};
-    for (int i = 0; i < 3; i++) {
-        slot = (void **)own[i].vt + 5;
-        VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = own[i].fn, VirtualProtect(slot, 4, old, &old);
-    }
-    for (int i = 0; clickable[i].vt; i++) {
-        void **slot = (void **)clickable[i].vt + 5;
-        DWORD old;
-        render_orig[i] = *slot;
-        VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_render, VirtualProtect(slot, 4, old, &old);
-    }
+static void hook_renders(void) { // vtable slot 5 = render(dev)
+    patch_ptr((void **)0x897134 + 5, h_busy_render), patch_ptr((void **)0x897258 + 5, h_sheet_render);
+    patch_ptr((void **)0x896610 + 5, h_spell_render), patch_ptr((void **)0x896578 + 5, h_combo_render);
+    for (int i = 0; clickable[i].vt; i++) render_orig[i] = patch_ptr((void **)clickable[i].vt + 5, h_render);
 }
 
 // Open windows (for "is a panel open") and the data-driven focusables, then publish.
-static struct { volatile int open; } ui;
+static volatile int ui_open;
 // Item grids: every grid window (backpack, chest, merchant, trade, cube...) writes its grid's screen origin into the
 // cInventoryEntry it shows (+0x1164/+0x1166) and draws it with 0x5dc430; that call is hooked, so each frame we know
 // every grid on screen. Entry: +0x18 cells of 12 bytes (+0 item ref in the top-left cell, +5/+6 item width/height),
@@ -529,18 +529,24 @@ static void add_grid(BYTE *e) {
     for (int i = 0; i < gw * gh; i++) {
         BYTE *cell = e + 0x18 + i * 12;
         RECT r = {x0 + i % gw * 32, y0 + i / gw * 32, x0 + i % gw * 32 + 32, y0 + i / gw * 32 + 32};
-        if (carrying) add_focus(r, F_CELL); // placing: every cell
+        if (carrying) add_focus(r, F_CTL); // placing: every cell
         else if (*(int *)cell) r.right = r.left + 32 * cell[5], r.bottom = r.top + 32 * cell[6], add_focus(r, F_ITEM);
     }
 }
 static void snapshot_ui(void) {
     BYTE *m = UIMGR, *mouse = *(BYTE **)0xcddb5c;
-    int open = 0;
+    int open = 0, answers = 0;
+    POINT ok = {-1, -1};
     carrying = mouse && *(int *)(mouse + 0x68);
     if (m) {
         Ctl **w = (Ctl **)(m + 0x80);
+        int covered = 0;
         for (int i = 0; i < 23; i++) // not the taskbar (0), party portraits (7) or slot 19: they are always up
-            if (i != 0 && i != 7 && i != 19 && ctl_ok(w[i]) && (w[i]->flags & 1)) open = 1;
+            if (i != 0 && i != 7 && i != 19 && ctl_ok(w[i]) && (w[i]->flags & 1)) {
+                POINT p = ctl_pos(w[i]);
+                open = 1, covered |= p.x < 440 && p.y < 40 && w[i]->w > 0 && w[i]->h > 0; // e.g. a merchant's tabs
+            }
+        legend_covered = covered;
         Ctl **end, **d = dialogs(m, &end);
         for (; d && d < end; d++)
             if (ctl_ok(*d) && ((*d)->flags & 1)) {
@@ -549,7 +555,9 @@ static void snapshot_ui(void) {
                     POINT p = ctl_pos(*d);       // records of 0x14 at +0x2180: +0 id, +4 x, +8 y, +0xc w, +0xe h
                     for (BYTE *a = (BYTE *)*d + 0x2180; a < (BYTE *)*d + 0x2180 + 4 * 0x14; a += 0x14) {
                         int x = *(int *)(a + 4), y = *(int *)(a + 8), aw = *(short *)(a + 0xc), ah = *(short *)(a + 0xe);
-                        if (aw > 0 && ah > 0) add_focus((RECT){p.x + x, p.y + y, p.x + x + aw, p.y + y + ah}, F_CTL);
+                        if (aw > 0 && ah > 0)
+                            add_focus((RECT){p.x + x, p.y + y, p.x + x + aw, p.y + y + ah}, F_CTL),
+                            ok = (POINT){p.x + x + aw / 2, p.y + y + ah / 2}, answers++;
                     }
                 }
             }
@@ -565,7 +573,7 @@ static void snapshot_ui(void) {
             for (Ctl **slot = (Ctl **)((BYTE *)eq + 0x15c); slot <= (Ctl **)((BYTE *)eq + 0x1a0); slot++)
                 if (ctl_ok(*slot) && ((*slot)->flags & 1)) {
                     POINT p = ctl_pos(*slot);
-                    add_focus((RECT){p.x, p.y, p.x + (*slot)->w, p.y + (*slot)->h}, F_SLOT);
+                    add_focus((RECT){p.x, p.y, p.x + (*slot)->w, p.y + (*slot)->h}, F_CTL);
                 }
     }
     // A confirmation pop-up (cUI_BusyDlg: Quit? Load game? ...) is modal: only what it drew is focusable.
@@ -576,7 +584,8 @@ static void snapshot_ui(void) {
         fcount[nb] = n > 0 ? n : 0, open = 1, modal_mark = -1;
     }
     fmodal[nb] = modal;
-    ui.open = open;
+    ui_open = open;
+    npc_ok = answers == 1 ? ok : (POINT){-1, -1};
     int w = !fpub;
     for (int i = 0; i < nsheets; i++) pub_sheets[i] = sheets[i], pub_sheet_tab[i] = sheet_tab[i];
     pub_nsheets = nsheets;
@@ -601,14 +610,6 @@ static int __fastcall h_pick_click(void *view, void *edx, int x, int y, unsigned
     return force >= 0 ? force : pick(view, edx, x, y, a, b);
 }
 
-static void patch_call(DWORD at, void *fn) {
-    BYTE *p = (BYTE *)at;
-    DWORD old;
-    if (*p != 0xE8) { LOG("patch_call: no call at %08lx", at); return; }
-    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
-    *(DWORD *)(p + 1) = (DWORD)fn - (at + 5);
-    VirtualProtect(p, 5, old, &old);
-}
 
 // Direct3D device setup (cDxDriver7, 0x645260): under Proton 11 the chosen device record's GUID pointer (+4) can
 // be stack garbage; the game then hands it to EnumZBufferFormats / CreateDevice and Proton's ddraw crashes on it.
@@ -624,14 +625,6 @@ static char __fastcall h_device_setup(void *drv, void *edx, BYTE *rec, void *a2,
 // On Wine the opener (0x6a0d80, cdecl) reports "no stream", and every caller then skips the movie.
 static int __cdecl h_movie_open(void *a, void *b, void **stream) { return *stream = 0, E_FAIL; }
 
-static void patch_jmp(DWORD at, void *fn) {
-    BYTE *p = (BYTE *)at;
-    DWORD old;
-    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
-    p[0] = 0xE9, *(DWORD *)(p + 1) = (DWORD)fn - (at + 5);
-    VirtualProtect(p, 5, old, &old);
-}
-
 // ---------------------------------------------------------------- overlay: button icons and the aim marker
 // Glyphs are painted once with GDI into small colour-keyed DirectDraw surfaces, then blitted onto the back
 // buffer right before the game flips (cDxDriver7 0x645e40: +0xb4 IDirectDraw7, +0xbc back buffer).
@@ -639,6 +632,8 @@ enum { G_A, G_B, G_X, G_Y, G_LB, G_RB, G_LT, G_RT, G_UP, G_DOWN, G_LEFT, G_RIGHT
        G_MENU_LEGEND, G_MAIN_LEGEND, G_ASSIGN_LEGEND, G_N };
 static IDirectDrawSurface7 *glyph[G_N], *glyph_back;
 static SIZE gsize[G_N];
+static DWORD frame_colour; // the focus frame's gold in the back buffer's pixel format
+static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT}; // the buttons of art slots 1..5
 
 static void paint_button(HDC dc, int x, int y, int g) { // one button icon with its top-left at x, y
     static const COLORREF face[] = {RGB(60, 176, 67), RGB(214, 56, 46), RGB(47, 120, 222), RGB(240, 192, 0)};
@@ -740,6 +735,9 @@ static int make_glyphs(IDirectDraw7 *dd, IDirectDrawSurface7 *back) {
             IDirectDrawSurface7_ReleaseDC(glyph[g], dc);
         }
         DWORD k = pf.dwRBitMask | pf.dwBBitMask; // magenta in any RGB format
+        const DWORD masks[3] = {pf.dwRBitMask, pf.dwGBitMask, pf.dwBBitMask}, gold[3] = {255, 200, 64};
+        frame_colour = 0;
+        for (int i = 0; i < 3; i++) frame_colour |= (DWORD)((unsigned long long)masks[i] * gold[i] / 255) & masks[i];
         DDCOLORKEY ck = {k, k};
         IDirectDrawSurface7_SetColorKey(glyph[g], DDCKEY_SRCBLT, &ck);
         gsize[g] = sz;
@@ -764,13 +762,8 @@ static void put(IDirectDrawSurface7 *back, int g, int cx, int cy) { // centred o
 
 // A two-pixel gold frame around r (colour fills: no glyph needed for arbitrary sizes).
 static void frame(IDirectDrawSurface7 *back, RECT r) {
-    DDPIXELFORMAT pf = {sizeof pf};
-    if (IDirectDrawSurface7_GetPixelFormat(back, &pf)) return;
-    DWORD c = 0;
-    const DWORD masks[3] = {pf.dwRBitMask, pf.dwGBitMask, pf.dwBBitMask}, rgb[3] = {255, 200, 64};
-    for (int i = 0; i < 3; i++) c |= (DWORD)((unsigned long long)masks[i] * rgb[i] / 255) & masks[i];
     DDBLTFX fx = {sizeof fx};
-    fx.dwFillColor = c;
+    fx.dwFillColor = frame_colour;
     InflateRect(&r, 2, 2);
     RECT e[4] = {{r.left, r.top, r.right, r.top + 2}, {r.left, r.bottom - 2, r.right, r.bottom},
                  {r.left, r.top, r.left + 2, r.bottom}, {r.right - 2, r.top, r.right, r.bottom}};
@@ -789,13 +782,12 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     IDirectDrawSurface7 *ref = *(IDirectDrawSurface7 **)(drv + 0xbc); // glyph format follows the back buffer
     if (ref != glyph_back) free_glyphs(), glyph_back = ref;
     if (!glyph[0] && !make_glyphs(dd, ref)) { busy = 0; return; }
-    int lt = (pad_shown & BTN_LT) != 0, in_world = hero() != NULL, world = in_world && !ui.open;
+    int lt = (pad_shown & BTN_LT) != 0, in_world = hero() != NULL, world = in_world && !ui_open;
     if (aiming) put(back, G_RING, reticle.x, reticle.y);
     if (pad_mode && !world && !free_cursor && !IsRectEmpty(&focus)) frame(back, focus);
     if (cfg.hints && pad_mode) {
         if (world) {
             int n = art_slots();
-            static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT};
             for (int i = 0; i < n; i++) put(back, art_g[i], lt ? 362 - (n - 1 - i) * 67 : 670 + i * 67, 690);
             put(back, G_LT, 362 - n * 67 + 12, 712);
             put(back, G_UP, lt ? 513 : 452, 652), put(back, G_RIGHT, 483, 652), put(back, G_LEFT, 545, 652), put(back, G_DOWN, 576, 652);
@@ -805,10 +797,9 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
             }
             if (locked && target == locked) put(back, G_LOCK, target_pos.x, target_pos.y);
         } else if (assigning) { // which button gets the art: the slots' buttons, and the prompt
-            static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT};
             for (int i = 0, n = art_slots(); i < n; i++) put(back, art_g[i], art_slot(i).x, 690);
             put(back, G_ASSIGN_LEGEND, 12 + gsize[G_ASSIGN_LEGEND].cx / 2, 20);
-        } else {
+        } else if (!(in_world && legend_covered)) {
             int g = in_world ? G_MENU_LEGEND : G_MAIN_LEGEND;
             put(back, g, 12 + gsize[g].cx / 2, in_world ? 20 : 748);
         }
@@ -841,7 +832,7 @@ static void __fastcall h_flip(void *drv) {
 
 static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e. once the window exists
     patch_call(0x64490d, h_device_setup);
-    if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_jmp(0x6a0d80, h_movie_open);
+    if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_rel(0x6a0d80, h_movie_open, 0xE9);
     patch_call(0x60ea8a, h_flip);        // world frame present
     patch_call(0x757250, h_flip);        // menu-thread present (main menu)
     static const DWORD grid_calls[] = {0x6a347d, 0x6a348b, 0x6acc3f, 0x6c14f5, 0x6daaa9, 0x6e8c3d, 0x6eafb1, 0x6eafc2};
@@ -886,9 +877,9 @@ static int walking, stand, acting;
 
 static POINT centre(RECT r) { return (POINT){(r.left + r.right) / 2, (r.top + r.bottom) / 2}; }
 
-static int focus_list(Focus *out) {
-    int p = fpub, n = fcount[p];
-    memcpy(out, fbuf[p], n * sizeof *out);
+static int focus_list(Focus *out) { // copy the published list; again if the render thread republished meanwhile
+    int p, n;
+    do p = fpub, n = fcount[p], memcpy(out, fbuf[p], n * sizeof *out); while (p != fpub);
     return n;
 }
 
@@ -907,8 +898,6 @@ static int step_focus(Focus *f, int n, int dx, int dy) {
     }
     return best;
 }
-
-static int release; // ticks until a scripted click is released
 
 // Scripted clicks for multi-step UI actions (drag and drop): each click moves the cursor, waits, presses, releases.
 static POINT clicks[4];
@@ -1002,13 +991,12 @@ static void update_menu(void) {
     }
     if (PRESSED(X) && focus_kind == F_ART) { assigning = 1; return; }
 
-    if (!release) key(VK_LBUTTON, DOWN(A));
+    key(VK_LBUTTON, DOWN(A));
     if (focus_kind != F_ART) key(VK_RBUTTON, DOWN(X)); // equip / use
-    if (PRESSED(B) || PRESSED(XINPUT_GAMEPAD_START)) tap(VK_ESCAPE);
+    if (PRESSED(B) && npc_ok.x >= 0) queue_click(npc_ok.x, npc_ok.y); // Esc doesn't close NPC text: its OK does
+    else if (PRESSED(B) || PRESSED(XINPUT_GAMEPAD_START)) tap(VK_ESCAPE);
     if (PRESSED(XINPUT_GAMEPAD_BACK)) tap('I');
-    // LB/RB: focus the previous/next tab of the sheet holding the focus and click it (released next tick, so the
-    // game sees the click where the cursor is).
-    if (release && !--release) key(VK_LBUTTON, 0);
+    // LB/RB: focus and click the previous/next tab of the sheet holding the focus.
     if ((PRESSED(LB) || PRESSED(RB)) && pub_nsheets) {
         POINT c = centre(focus);
         int k = 0;
@@ -1016,14 +1004,14 @@ static void update_menu(void) {
         int t = (pub_sheet_tab[k] + (PRESSED(RB) ? 1 : 2)) % 3;
         int x = pub_sheets[k].left + (int[]){73, 229, 391}[t], y = pub_sheets[k].top; // header centre
         focus = (RECT){x - 70, y - 12, x + 70, y + 12}, free_cursor = 0;
-        move_cursor(x, y), key(VK_LBUTTON, 1), release = 2;
+        queue_click(x, y);
     }
 }
 
 static void update(void) {
     int lt = DOWN(BTN_LT);
     static int was_menu;
-    int menu = !hero() || ui.open;
+    int menu = !hero() || ui_open;
     static WORD swallow; // buttons held across a world/menu switch do nothing until released
     if (menu != was_menu) { // hand over cleanly between world and menu controls
         key(VK_LBUTTON, 0), key(VK_RBUTTON, 0), key(VK_MENU, 0), key(VK_CONTROL, 0);
@@ -1143,7 +1131,7 @@ static void tick(void) {
     if (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) pad_mode = 1;
     if (ctl_cx >= 0) pad_mode = 1, cursor_mode = 1, cursor_idle = 0, free_cursor = 1, move_cursor(ctl_cx, ctl_cy);
     static int last_open = -1;
-    if (ui.open != last_open) LOG("ui open=%d focusables=%d", ui.open, fcount[fpub]), last_open = ui.open;
+    if (ui_open != last_open) LOG("ui open=%d focusables=%d", ui_open, fcount[fpub]), last_open = ui_open;
     if (!pad_mode) { cursor_hidden = 0; return; }
     update();
     if (pad.btn != prev.btn)
@@ -1187,10 +1175,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD st
         patch_engine();
         game_proc = (WNDPROC)SetWindowLongA(r, GWL_WNDPROC, (LONG)game_wndproc);
         real_SetWindowLongA = (void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetWindowLongA");
-        DWORD old;
-        VirtualProtect((void *)0xa23fb4, 4, PAGE_READWRITE, &old);
-        *(void **)0xa23fb4 = h_SetWindowLongA;
-        VirtualProtect((void *)0xa23fb4, 4, old, &old);
+        patch_ptr((void *)0xa23fb4, h_SetWindowLongA); // the game's delay-loaded SetWindowLongA
         CreateThread(NULL, 0, tick_thread, NULL, 0, NULL);
     }
     return r;
@@ -1203,14 +1188,8 @@ static void *hook(const char *dll, const char *name, void *fn) {
     IMAGE_NT_HEADERS *nt = (void *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
     IMAGE_DATA_DIRECTORY *d = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
     int n = 0;
-    for (void **p = (void **)(base + d->VirtualAddress); p < (void **)(base + d->VirtualAddress + d->Size); p++) {
-        if (*p != real) continue;
-        DWORD old;
-        VirtualProtect(p, sizeof *p, PAGE_READWRITE, &old);
-        *p = fn;
-        VirtualProtect(p, sizeof *p, old, &old);
-        n++;
-    }
+    for (void **p = (void **)(base + d->VirtualAddress); p < (void **)(base + d->VirtualAddress + d->Size); p++)
+        if (*p == real) patch_ptr(p, fn), n++;
     if (!n) LOG("hook: %s!%s not found in IAT", dll, name);
     return real;
 }
@@ -1242,7 +1221,7 @@ static LONG CALLBACK crash_log(EXCEPTION_POINTERS *e) {
     char calls[256] = "", *o = calls;
     for (int i = 0; i < 64 && o < calls + sizeof calls - 12 && !IsBadReadPtr(sp + i, 4); i++)
         if (sp[i] > 0x401000 && sp[i] < 0x890000) o += sprintf(o, " %08lx", sp[i]); // game return addresses (likely)
-    LOG("  stack:%s  pad=%04x ui=%d", calls, pad.btn, ui.open);
+    LOG("  stack:%s  pad=%04x ui=%d", calls, pad.btn, ui_open);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
