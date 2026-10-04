@@ -101,5 +101,15 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
   Fullscreen flips the front (+0xb8); mouse singleton `*0xcddb5c`, +4/+8 = cursor sprite position.
 - Hero +0x3fe level (HUD slots: 1 + at levels 2, 8, 16, 30), +0x1ec ridden horse, creature +0x1f0 == 4: horse.
   Dismount = Shift + click whose picked ref is the ridden horse (click handler 0x6172c0).
+- Focus (2026-10-04): clickable controls are recorded as they draw (vtable slot 5 = render(dev), ret 4, hooked per
+  class: Button2, RadioButton2, StaticText64 [+0x98 command], StaticText64FX [+0x88 command], EditControl,
+  DigitEdit, Combobox, Listbox, Listbox2; flags & 4 = enabled). Hidden pages/tabs never draw, so the list is
+  exactly what's on screen. Text draws 2-9x (shadow/glow offsets): de-duplicated. Parentless buttons = HUD potions.
+- Grids: windows store their cInventoryEntry index at +0x158, write the grid's screen origin to entry
+  +0x1164/+0x1166, then draw it with 0x5dc430 (thiscall entry, dev, flag; 8 call sites, hooked). Cells 32 px.
+  Equipment slots: cUI_Equipment +0x15c..+0x1a0 = UI_EQ_* cUI_Static2 controls.
+- Cursor draw: 0x655450 (thiscall mouse, dev, glow), from 0x612e6a/0x612e91 (world) and 0x757227 (menus).
+- Main menu runs on its own thread (no world frame loop): UI snapshot is taken at every present instead.
+- Character select: heroes are models on 8 pedestals (screen points in snapshot_ui), same on the Import page.
 - Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
   Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.

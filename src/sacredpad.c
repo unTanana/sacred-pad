@@ -54,7 +54,8 @@ static DWORD (WINAPI *xget)(DWORD, XINPUT_STATE *);
 static int ctl_cx = -1, ctl_cy = -1; // test mode: CX=/CY= put the cursor at an exact client position
 static volatile int ctl_dump;          // test mode: DUMP logs the classified objects around the hero
 static volatile int ctl_far;           // test mode: FAR lifts the target radius / on-screen limit
-static volatile int ctl_uidump;        // test mode: UIDUMP logs the visible UI tree
+static volatile int ctl_uiscan;        // test mode: UISCAN logs controls found by scanning window memory
+static volatile int ctl_focus;         // test mode: FOCUS logs the focus list
 static volatile unsigned target, locked; // soft target; R3 lock
 static volatile unsigned mount_ref;         // the horse the hero rides (hero +0x1ec), 0 on foot
 static volatile int hero_level;             // hero +0x3fe: decides how many HUD slots are unlocked
@@ -95,7 +96,8 @@ static void read_pad(void) {
                 if (!strcmp(t, btn_names[i].name)) pad.btn |= btn_names[i].bit;
             if (!strcmp(t, "DUMP")) ctl_dump = 1;
             if (!strcmp(t, "FAR")) ctl_far = 1;
-            if (!strcmp(t, "UIDUMP")) ctl_uidump = 1;
+            if (!strcmp(t, "UISCAN")) ctl_uiscan = 1;
+            if (!strcmp(t, "FOCUS")) ctl_focus = 1;
         }
         if (f) fclose(f);
         return;
@@ -263,19 +265,11 @@ static POINT to_screen(int x, int y) {
 // ---------------------------------------------------------------- UI (cUI_Manager and its windows)
 #define UIMGR (*(BYTE **)0x17eebbc) // +0x80..+0xd8: one window pointer per UI_WND_*
 typedef struct Ctl { void **vt; int _4, _8, _c, flags, _14[4]; int x, y; short w, h; char name[32]; struct Ctl *parent;
-                     BYTE _54[0x24]; struct Ctl **kids, **kids_end; } Ctl; // cUI_Control2 / cUI_Window2 prefix
-// UI pointers are walked from the engine thread while the game builds and tears windows down, and +0x78 is
-// only a child list on some window classes: validate everything before following it.
+                   } Ctl; // cUI_Control2 prefix
+// UI pointers are read on the render threads while the game builds and tears windows down: validate before use.
 static int ctl_ok(Ctl *c) {
     return (DWORD)c > 0x10000 && !((DWORD)c & 3) && !IsBadReadPtr(c, sizeof *c) &&
            (DWORD)c->vt >= 0x88f000 && (DWORD)c->vt < 0x8e7000; // a vtable in the game's .rdata
-}
-static Ctl **kids(Ctl *c, Ctl ***end) {
-    *end = c->kids_end;
-    if (!c->kids || c->kids_end <= c->kids || c->kids_end - c->kids > 256 || ((DWORD)c->kids & 3) ||
-        IsBadReadPtr(c->kids, (c->kids_end - c->kids) * sizeof *c->kids))
-        return *end = NULL;
-    return c->kids;
 }
 static Ctl **dialogs(BYTE *m, Ctl ***end) { // cUI_Manager's [+0x124, +0x128) list of open dialogs
     Ctl **b = *(Ctl ***)(m + 0x124);
@@ -288,12 +282,47 @@ static POINT ctl_pos(Ctl *c) { // absolute: x/y are relative to the parent
     for (int i = 0; ctl_ok(c) && i < 16; c = c->parent, i++) p.x += c->x, p.y += c->y;
     return p;
 }
-static void ui_dump(Ctl *c, int depth) {
-    if (!ctl_ok(c) || !(c->flags & 1) || depth > 6) return;
-    POINT p = ctl_pos(c);
-    LOG("ui %*s%.32s vt=%p at %ld,%ld %dx%d flags=%x", depth * 2, "", c->name, (void *)c->vt, p.x, p.y, c->w, c->h, c->flags);
-    Ctl **end, **k = kids(c, &end);
-    for (; k && k < end; k++) ui_dump(*k, depth + 1);
+// Discovery: controls owned by w, found by scanning w's memory for pointers / std::vector ranges of them.
+static int owned_by(Ctl *c, Ctl *w) {
+    for (int i = 0; ctl_ok(c) && i < 8; i++, c = c->parent) if (c->parent == w) return 1;
+    return 0;
+}
+static void ui_scan(Ctl *w, int depth) {
+    if (!ctl_ok(w) || depth > 3) return;
+    POINT wp = ctl_pos(w);
+    LOG("scan %*s%.32s vt=%p at %ld,%ld %dx%d flags=%x", depth * 2, "", w->name, (void *)w->vt, wp.x, wp.y, w->w, w->h, w->flags);
+    for (int off = 0x54; off < 0x600; off += 4) {
+        DWORD *f = (DWORD *)((BYTE *)w + off);
+        if (IsBadReadPtr(f, 8)) break;
+        Ctl *c = (Ctl *)f[0];
+        if (ctl_ok(c) && c != w && owned_by(c, w)) {
+            POINT p = ctl_pos(c);
+            LOG("scan %*s +%03x ptr %.32s vt=%p at %ld,%ld %dx%d flags=%x", depth * 2, "", off, c->name, (void *)c->vt, p.x, p.y, c->w, c->h, c->flags);
+            if (depth < 3 && c->vt != w->vt) ui_scan(c, depth + 1);
+            continue;
+        }
+        Ctl **b = (Ctl **)f[0], **e = (Ctl **)f[1];
+        if ((DWORD)b > 0x10000 && e > b && e - b <= 256 && !IsBadReadPtr(b, (e - b) * 4) && ctl_ok(*b) && owned_by(*b, w)) {
+            LOG("scan %*s +%03x vec[%d]", depth * 2, "", off, (int)(e - b));
+            for (Ctl **k = b; k < e; k++) {
+                if (!ctl_ok(*k)) continue;
+                POINT p = ctl_pos(*k);
+                LOG("scan %*s    %.32s vt=%p at %ld,%ld %dx%d flags=%x", depth * 2, "", (*k)->name, (void *)(*k)->vt, p.x, p.y, (*k)->w, (*k)->h, (*k)->flags);
+            }
+            off += 4;
+        }
+    }
+}
+static void ui_scan_all(void) {
+    BYTE *m = UIMGR;
+    if (!m) return;
+    for (int off = 0; off < 0x2f4; off += 4) { // every visible window the manager points to
+        Ctl *w = *(Ctl **)(m + off);
+        if (ctl_ok(w) && (w->flags & 1) && !w->parent && w->vt != (void **)0x896ac0 && w->vt != (void **)0x8968cc)
+            LOG("scan manager +%03x", off), ui_scan(w, 0);
+    }
+    Ctl **end, **d = dialogs(m, &end);
+    for (; d && d < end; d++) if (ctl_ok(*d) && ((*d)->flags & 1)) LOG("scan dialog"), ui_scan(*d, 0);
 }
 
 // ---------------------------------------------------------------- targeting (runs on the engine thread, per frame)
@@ -335,16 +364,6 @@ static void update_targets(void *view) {
         if (score < best) best = score, best_ref = r, best_pos = s, target_kind = k;
     }
     if (locked && best_ref != locked) locked = 0; // lock lost (dead, gone, off screen)
-    if (ctl_uidump && UIMGR) {
-        ctl_uidump = 0;
-        for (int i = 0; i < 23; i++) ui_dump(((Ctl **)(UIMGR + 0x80))[i], 0);
-        for (int i = 0; i < 23; i++) {
-            Ctl *w = ((Ctl **)(UIMGR + 0x80))[i];
-            LOG("uiw %d %.32s vt=%p vis=%d", i, w ? w->name : "-", w ? (void *)w->vt : 0, w ? w->flags & 1 : 0);
-        }
-        Ctl **end, **w = dialogs(UIMGR, &end);
-        for (; w && w < end; w++) ui_dump(*w, 0);
-    }
     if (ctl_dump) {
         ctl_dump = 0;
         LOG("dump: target=%u kind=%d best=%f aim=%f,%f far=%d locked=%u", best_ref, target_kind, best, aim_x, aim_y, ctl_far, locked);
@@ -363,46 +382,115 @@ static void update_targets(void *view) {
     target = best_ref, target_pos = best_pos;
 }
 
-// Snapshot of the open panels/dialogs, taken on the engine thread (the input thread never walks UI pointers).
-static struct { volatile int open, nwin, nbtn; RECT win[24]; int grid[24]; POINT btn[64]; volatile void *dlg; POINT ok; } ui;
-static void collect_buttons(Ctl *c, int depth) {
-    if (!ctl_ok(c) || !(c->flags & 1) || depth > 6) return;
-    if ((c->vt == (void **)0x897308 || c->vt == (void **)0x89733c) && ui.nbtn < 64) { // cUI_Button2 / RadioButton2
-        POINT p = ctl_pos(c);
-        ui.btn[ui.nbtn++] = (POINT){p.x + c->w / 2, p.y + c->h / 2};
+// ---------------------------------------------------------------- focus: what can be selected on screen
+// Clickable controls are recorded as the game draws them (their render, vtable slot 5, is hooked per class), so the
+// list is exactly what is on screen: hidden pages, tabs and closed windows never draw. Item grids come from the
+// inventory data. The list is built on the render thread and published at each present.
+typedef struct { RECT r; int kind; } Focus;
+enum { F_CTL, F_ITEM, F_SLOT, F_CELL };
+#define MAXF 256
+static Focus fbuf[2][MAXF];
+static volatile int fpub, fcount[2]; // fbuf[fpub] is the published list, fbuf[!fpub] is being built
+static volatile int carrying;        // an item hangs on the cursor (mouse +0x68)
+static RECT focus;                   // current menu focus; empty = none
+static int free_cursor;              // the right stick took over in a menu
+static volatile int cursor_hidden;   // the pad drives: the game does not draw its cursor
+
+static void add_focus(RECT r, int kind) {
+    int w = !fpub, n = fcount[w];
+    if (n >= MAXF || r.right <= r.left || r.bottom <= r.top) return;
+    for (int i = 0; i < n; i++) { // text is drawn twice (shadow pass, a few pixels off): keep one
+        RECT *o = &fbuf[w][i].r;
+        if (abs(o->left - r.left) <= 8 && abs(o->top - r.top) <= 8 && o->right - o->left == r.right - r.left) return;
     }
-    Ctl **end, **k = kids(c, &end);
-    for (; k && k < end; k++) collect_buttons(*k, depth + 1);
+    fbuf[w][n] = (Focus){r, kind}, fcount[w] = n + 1;
 }
-static void add_window(Ctl *w, int grid) {
-    if (!ctl_ok(w) || !(w->flags & 1) || ui.nwin >= 24) return;
-    POINT p = ctl_pos(w);
-    ui.grid[ui.nwin] = grid;
-    ui.win[ui.nwin++] = (RECT){p.x, p.y, p.x + w->w, p.y + w->h};
-    collect_buttons(w, 0);
+
+static const struct { DWORD vt; int cmd; } clickable[] = { // cmd: offset of the command a click runs, 0 = any
+    {0x897308, 0}, {0x89733c, 0}, {0x897700, 0x98}, {0x897758, 0x88}, {0x897534, 0}, {0x8974d8, 0},
+    {0x8973c0, 0}, {0x8975e8, 0}, {0x897620, 0}, {0, 0}};
+static void (__fastcall *render_orig[16])(void *, void *, void *);
+static void __fastcall h_render(Ctl *c, void *edx, void *dev) {
+    int i = 0;
+    while (clickable[i].vt && clickable[i].vt != (DWORD)c->vt) i++;
+    if (clickable[i].vt && (c->flags & 5) == 5 && (!clickable[i].cmd || *(void **)((BYTE *)c + clickable[i].cmd))) {
+        Ctl *root = c;
+        for (int k = 0; k < 16 && ctl_ok(root->parent); k++) root = root->parent;
+        // Not the HUD: the taskbar, the party portraits, and parentless buttons (the compass potions).
+        if (root != c && root->vt != (void **)0x896ac0 && root->vt != (void **)0x8968cc) {
+            POINT p = ctl_pos(c);
+            add_focus((RECT){p.x, p.y, p.x + c->w, p.y + c->h}, F_CTL);
+        }
+    }
+    render_orig[i](c, edx, dev);
+}
+static void hook_renders(void) {
+    for (int i = 0; clickable[i].vt; i++) {
+        void **slot = (void **)clickable[i].vt + 5;
+        DWORD old;
+        render_orig[i] = *slot;
+        VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_render, VirtualProtect(slot, 4, old, &old);
+    }
+}
+
+// Open windows (for "is a panel open") and the data-driven focusables, then publish.
+static struct { volatile int open; } ui;
+// Item grids: every grid window (backpack, chest, merchant, trade, cube...) writes its grid's screen origin into the
+// cInventoryEntry it shows (+0x1164/+0x1166) and draws it with 0x5dc430; that call is hooked, so each frame we know
+// every grid on screen. Entry: +0x18 cells of 12 bytes (+0 item ref in the top-left cell, +5/+6 item width/height),
+// +0x115c/+0x115e grid width/height.
+static BYTE *grids[8];
+static volatile int ngrids;
+static void (__fastcall *grid_draw)(void *, void *, void *, int) = (void *)0x5dc430;
+static void __fastcall h_grid_draw(BYTE *entry, void *edx, void *dev, int flag) {
+    int n = ngrids;
+    if (n < 8) grids[n] = entry, ngrids = n + 1;
+    grid_draw(entry, edx, dev, flag);
+}
+static void add_grid(BYTE *e) {
+    int gw = *(WORD *)(e + 0x115c), gh = *(WORD *)(e + 0x115e), x0 = *(short *)(e + 0x1164), y0 = *(short *)(e + 0x1166);
+    if (gw <= 0 || gh <= 0 || gw * gh > 256) return;
+    for (int i = 0; i < gw * gh; i++) {
+        BYTE *cell = e + 0x18 + i * 12;
+        RECT r = {x0 + i % gw * 32, y0 + i / gw * 32, x0 + i % gw * 32 + 32, y0 + i / gw * 32 + 32};
+        if (carrying) add_focus(r, F_CELL); // placing: every cell
+        else if (*(int *)cell) r.right = r.left + 32 * cell[5], r.bottom = r.top + 32 * cell[6], add_focus(r, F_ITEM);
+    }
 }
 static void snapshot_ui(void) {
-    BYTE *m = UIMGR;
-    ui.nwin = ui.nbtn = 0;
+    BYTE *m = UIMGR, *mouse = *(BYTE **)0xcddb5c;
+    int open = 0;
+    carrying = mouse && *(int *)(mouse + 0x68);
     if (m) {
         Ctl **w = (Ctl **)(m + 0x80);
         for (int i = 0; i < 23; i++) // not the taskbar (0), party portraits (7) or slot 19: they are always up
-            if (i != 0 && i != 7 && i != 19)
-                add_window(w[i], i == 1 || i == 2 || i == 3 || i == 4 || i == 13 || i == 16 || i == 21 || i == 22);
-        void *dlg = 0;
+            if (i != 0 && i != 7 && i != 19 && ctl_ok(w[i]) && (w[i]->flags & 1)) open = 1;
         Ctl **end, **d = dialogs(m, &end);
-        for (; d && d < end; d++) {
-            add_window(*d, 0);
-            // NPC text (a big cUI_Tooltip; small ones are hover tooltips): its OK is drawn bottom centre
-            if (ctl_ok(*d) && ((*d)->flags & 1) && (*d)->vt == (void **)0x896b3c && (*d)->w >= 300 && (*d)->h >= 100 &&
-                (!dlg || (*d)->w * (*d)->h > ((Ctl *)dlg)->w * ((Ctl *)dlg)->h)) {
-                POINT p = ctl_pos(*d);
-                ui.ok = (POINT){p.x + (*d)->w / 2, p.y + (*d)->h - 19}, dlg = *d;
+        for (; d && d < end; d++)
+            if (ctl_ok(*d) && ((*d)->flags & 1)) {
+                open = 1;
+                if ((*d)->vt == (void **)0x896b3c && (*d)->w >= 300 && (*d)->h >= 100) { // NPC text: OK drawn bottom centre
+                    POINT p = ctl_pos(*d);
+                    add_focus((RECT){p.x + (*d)->w / 2 - 30, p.y + (*d)->h - 30, p.x + (*d)->w / 2 + 30, p.y + (*d)->h - 8}, F_CTL);
+                }
             }
+        // Character select / import: the heroes stand on eight pedestals (3D models, not controls).
+        if (ctl_ok(w[20]) && (w[20]->flags & 1)) {
+            static const POINT pedestal[] = {{100, 470}, {216, 360}, {380, 400}, {524, 440}, {630, 340}, {730, 420}, {810, 350}, {890, 480}};
+            for (int i = 0; i < 8; i++) add_focus((RECT){pedestal[i].x - 30, pedestal[i].y - 60, pedestal[i].x + 30, pedestal[i].y + 60}, F_CTL);
         }
-        ui.dlg = dlg;
+        for (int i = 0; i < ngrids; i++) add_grid(grids[i]);
+        Ctl *eq = w[2];
+        if (ctl_ok(eq) && (eq->flags & 1)) // equipment slots: the UI_EQ_* controls at cUI_Equipment +0x15c..+0x1a0
+            for (Ctl **slot = (Ctl **)((BYTE *)eq + 0x15c); slot <= (Ctl **)((BYTE *)eq + 0x1a0); slot++)
+                if (ctl_ok(*slot) && ((*slot)->flags & 1)) {
+                    POINT p = ctl_pos(*slot);
+                    add_focus((RECT){p.x, p.y, p.x + (*slot)->w, p.y + (*slot)->h}, F_SLOT);
+                }
     }
-    ui.open = ui.nwin > 0;
+    ui.open = open;
+    int w = !fpub;
+    fpub = w, fcount[!w] = 0, ngrids = 0; // publish; start the next list
 }
 
 // The engine's per-frame cursor pass (engine thread). Targeting runs here, before the pass skips its pick
@@ -410,7 +498,6 @@ static void snapshot_ui(void) {
 static int (__fastcall *cursor_pass)(void *, void *, int, int) = (void *)0x611e70;
 static int __fastcall h_cursor_pass(void *engine, void *edx, int a, int b) {
     BYTE *e = engine;
-    snapshot_ui();
     update_targets(*(void **)(e + 8 + 4 * *(WORD *)(e + 0x48))); // the current cWorldView
     return cursor_pass(engine, edx, a, b);
 }
@@ -581,6 +668,24 @@ static void put(IDirectDrawSurface7 *back, int g, int cx, int cy) { // centred o
         free_glyphs(); // a mode switch: rebuild next frame
 }
 
+// A two-pixel gold frame around r (colour fills: no glyph needed for arbitrary sizes).
+static void frame(IDirectDrawSurface7 *back, RECT r) {
+    DDPIXELFORMAT pf = {sizeof pf};
+    if (IDirectDrawSurface7_GetPixelFormat(back, &pf)) return;
+    DWORD c = 0;
+    const DWORD masks[3] = {pf.dwRBitMask, pf.dwGBitMask, pf.dwBBitMask}, rgb[3] = {255, 200, 64};
+    for (int i = 0; i < 3; i++) c |= (DWORD)((unsigned long long)masks[i] * rgb[i] / 255) & masks[i];
+    DDBLTFX fx = {sizeof fx};
+    fx.dwFillColor = c;
+    InflateRect(&r, 2, 2);
+    RECT e[4] = {{r.left, r.top, r.right, r.top + 2}, {r.left, r.bottom - 2, r.right, r.bottom},
+                 {r.left, r.top, r.left + 2, r.bottom}, {r.right - 2, r.top, r.right, r.bottom}};
+    for (int i = 0; i < 4; i++) {
+        RECT x = e[i], screen = {0, 0, 1024, 768};
+        if (IntersectRect(&x, &x, &screen)) IDirectDrawSurface7_Blt(back, &x, NULL, NULL, DDBLT_COLORFILL | DDBLT_WAIT, &fx);
+    }
+}
+
 // HUD geometry (1024x768): art slots 6..0 grow right from x=670, weapon slots 1..n end at x=362; one slot more at
 // levels 2, 8, 16 and 30. Potions sit on the compass at the top of the HUD.
 static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
@@ -592,6 +697,7 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     if (!glyph[0] && !make_glyphs(dd, ref)) { busy = 0; return; }
     int lt = (pad_shown & BTN_LT) != 0, in_world = hero() != NULL, world = in_world && !ui.open;
     if (aiming) put(back, G_RING, reticle.x, reticle.y);
+    if (pad_mode && !world && !free_cursor && !IsRectEmpty(&focus)) frame(back, focus);
     if (cfg.hints && pad_mode) {
         if (world) {
             int lvl = hero_level, n = 1 + (lvl >= 2) + (lvl >= 8) + (lvl >= 16) + (lvl >= 30);
@@ -612,9 +718,17 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     busy = 0;
 }
 
+// The game's cursor draw (mouse, device, glow): skipped while the pad hides the cursor.
+static void (__fastcall *cursor_draw)(void *, void *, void *, int) = (void *)0x655450;
+static void __fastcall h_cursor_draw(void *mouse, void *edx, void *dev, int glow) {
+    if (!cursor_hidden) cursor_draw(mouse, edx, dev, glow);
+}
+
 static void (__fastcall *flip)(void *) = (void *)0x645e40;
 static void __fastcall h_flip(void *drv) {
     BYTE *d = drv;
+    snapshot_ui(); // every present: the world's engine thread and the menus' own thread both come through here
+    if (ctl_uiscan) ctl_uiscan = 0, ui_scan_all();
     // The fullscreen main menu (menu thread, 0x757250) does not show what is blitted onto its back buffer:
     // there the overlay goes onto the front surface right after the flip.
     if (__builtin_return_address(0) == (void *)0x757255 && *(int *)(d + 0x90) == 1) {
@@ -632,6 +746,12 @@ static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e
     if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_jmp(0x6a0d80, h_movie_open);
     patch_call(0x60ea8a, h_flip);        // world frame present
     patch_call(0x757250, h_flip);        // menu-thread present (main menu)
+    static const DWORD grid_calls[] = {0x6a347d, 0x6a348b, 0x6acc3f, 0x6c14f5, 0x6daaa9, 0x6e8c3d, 0x6eafb1, 0x6eafc2};
+    for (int i = 0; i < 8; i++) patch_call(grid_calls[i], h_grid_draw);
+    patch_call(0x612e6a, h_cursor_draw); // the world's cursor
+    patch_call(0x612e91, h_cursor_draw);
+    patch_call(0x757227, h_cursor_draw); // the menus' cursor
+    hook_renders();
     patch_call(0x60e9c7, h_cursor_pass); // engine frame loop
     patch_call(0x60ea01, h_cursor_pass);
     patch_call(0x611f64, h_pick_hover);  // hover inside the cursor pass
@@ -663,64 +783,92 @@ static void aim_action(void) {
 
 static int walking, stand, acting;
 
-// D-pad in menus: jump to the nearest button that way; inside item grids (or with no button that way) step one
-// 32-pixel cell, snapped to the grid of the window under the cursor.
-static void menu_step(int dx, int dy) {
-    int gi = -1;
-    for (int i = 0; i < ui.nwin; i++)
-        if (ui.grid[i] && PtInRect(&ui.win[i], vcur)) gi = i;
-    if (gi < 0) {
-        float best = 1e9f;
-        POINT to = {-1, -1};
-        for (int i = 0; i < ui.nbtn; i++) {
-            float bx = ui.btn[i].x - vcur.x, by = ui.btn[i].y - vcur.y, along = bx * dx + by * dy;
-            float across = fabsf(bx * dy - by * dx);
-            if (along < 8 || across > along * 1.5f) continue; // roughly that way
-            if (along + 2 * across < best) best = along + 2 * across, to = ui.btn[i];
-        }
-        if (to.x >= 0) { move_cursor(to.x, to.y); return; }
-    }
-    POINT p = {vcur.x + dx * 32, vcur.y + dy * 32};
-    for (int i = 0; i < ui.nwin; i++)
-        if (ui.grid[i] && PtInRect(&ui.win[i], p)) {
-            p.x = ui.win[i].left + 16 + (p.x - ui.win[i].left) / 32 * 32;
-            p.y = ui.win[i].top + 16 + (p.y - ui.win[i].top) / 32 * 32;
-        }
-    move_cursor(p.x, p.y);
+// Menus: focus moves between the published focusables; the (hidden) cursor sits on the focused one so the game's own
+// hover effects and tooltips show, and A/X click there. The right stick is a free cursor for anything not covered.
+
+static POINT centre(RECT r) { return (POINT){(r.left + r.right) / 2, (r.top + r.bottom) / 2}; }
+
+static int focus_list(Focus *out) {
+    int p = fpub, n = fcount[p];
+    memcpy(out, fbuf[p], n * sizeof *out);
+    return n;
 }
 
-// Panels, dialogs and the menus: the sticks drive the cursor, the D-pad snaps, A/X click.
-static void update_menu(int entered) {
-    static float fx, fy;
+// The focusable nearest in direction (dx, dy) from the current focus: distance along the direction plus twice the
+// sideways offset, within a 60-degree-ish cone; items stacked on the same line win over diagonal ones.
+static int step_focus(Focus *f, int n, int dx, int dy) {
+    POINT c = centre(focus);
+    int best = -1;
+    float bs = 1e9f;
+    for (int i = 0; i < n; i++) {
+        if (EqualRect(&f[i].r, &focus)) continue;
+        POINT q = centre(f[i].r);
+        float along = (float)(q.x - c.x) * dx + (float)(q.y - c.y) * dy, across = fabsf((float)(q.x - c.x) * dy - (float)(q.y - c.y) * dx);
+        if (along < 4 || across > along * 1.8f) continue;
+        if (along + 2 * across < bs) bs = along + 2 * across, best = i;
+    }
+    return best;
+}
+
+static void update_menu(void) {
+    static Focus f[MAXF];
     static int repeat, tab;
-    // A dialog appeared: put the cursor on its OK, and follow the OK while the game is still placing the dialog
-    // (its first position is provisional) unless the player has moved the cursor since.
-    static void *last_dlg;
-    static POINT ok, parked;
-    if (!ui.dlg) last_dlg = NULL;
-    else if (ui.dlg != last_dlg || (vcur.x == parked.x && vcur.y == parked.y && (ui.ok.x != ok.x || ui.ok.y != ok.y))) {
-        last_dlg = (void *)ui.dlg, ok = ui.ok;
-        move_cursor(ok.x, ok.y), parked = vcur;
+    int n = focus_list(f);
+
+    // Keep the focus if it is still on screen; otherwise take the nearest (or the first for a new screen).
+    int cur = -1;
+    for (int i = 0; i < n; i++)
+        if (EqualRect(&f[i].r, &focus)) cur = i;
+    if (cur < 0 && n) {
+        POINT c = centre(focus);
+        float bd = 1e9f;
+        for (int i = 0; i < n; i++) {
+            POINT q = centre(f[i].r);
+            float d = !IsRectEmpty(&focus) ? hypotf(q.x - c.x, q.y - c.y)
+                    : q.y * 4.f + q.x + (f[i].kind == F_ITEM ? 0 : 1e6f); // new screen: first item, else top-left
+            if (d < bd) bd = d, cur = i;
+        }
+        focus = f[cur].r;
+        if (!free_cursor) move_cursor(centre(focus).x, centre(focus).y);
     }
-    if (!ui.dlg && entered && hero()) { // a panel just opened: start on its first button, or its middle
-        if (ui.nbtn) move_cursor(ui.btn[0].x, ui.btn[0].y);
-        else if (ui.nwin) move_cursor((ui.win[0].left + ui.win[0].right) / 2, (ui.win[0].top + ui.win[0].bottom) / 2);
+    if (!n) SetRectEmpty(&focus);
+
+    // D-pad or left stick: move focus (auto-repeat while held).
+    int dx = 0, dy = 0;
+    if (DOWN(XINPUT_GAMEPAD_DPAD_LEFT) || pad.lx < -0.5f) dx = -1;
+    if (DOWN(XINPUT_GAMEPAD_DPAD_RIGHT) || pad.lx > 0.5f) dx = 1;
+    if (DOWN(XINPUT_GAMEPAD_DPAD_UP) || pad.ly > 0.5f) dy = -1;
+    if (DOWN(XINPUT_GAMEPAD_DPAD_DOWN) || pad.ly < -0.5f) dy = 1;
+    if (dy) dx = 0; // one axis at a time: vertical wins
+    static int held;
+    if (!dx && !dy) held = 0;
+    else if ((!held || --repeat <= 0) && n) {
+        int k = step_focus(f, n, dx, dy);
+        if (k >= 0) focus = f[k].r;
+        free_cursor = 0;
+        move_cursor(centre(focus).x, centre(focus).y);
+        repeat = held ? 12 : 30, held = 1; // 240 ms before repeating, then every 96 ms
     }
-    float lx = pad.lx + pad.rx, ly = pad.ly + pad.ry, m = fminf(hypotf(lx, ly), 1);
-    if (lroundf(fx) != vcur.x || lroundf(fy) != vcur.y) fx = vcur.x, fy = vcur.y; // moved by something else
-    if (m > 0) {
-        float v = (1.5f + 10 * m) * cfg.cursor_speed / 12.f; // slow near the centre for precise aiming
-        fx += lx * v, fy -= ly * v; // keeps the fractions: slow pushes still move
-        move_cursor(lroundf(fx), lroundf(fy));
+    if (!free_cursor && n && cur >= 0) { // follow a focusable that moved (windows sliding in)
+        POINT c = centre(focus);
+        if (c.x != vcur.x || c.y != vcur.y) move_cursor(c.x, c.y);
     }
 
-    static const WORD dirs[] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
-    static const int ddx[] = {0, 0, -1, 1}, ddy[] = {-1, 1, 0, 0};
-    for (int i = 0; i < 4; i++)
-        if (PRESSED(dirs[i]) || (DOWN(dirs[i]) && --repeat == 0)) {
-            menu_step(ddx[i], ddy[i]);
-            repeat = PRESSED(dirs[i]) ? 30 : 12; // auto-repeat after 240 ms, then every 96 ms
-        }
+    // Right stick: free cursor (also the fallback where nothing is focusable).
+    if (pad.rx || pad.ry) {
+        static float fx, fy;
+        if (!free_cursor) fx = vcur.x, fy = vcur.y;
+        free_cursor = 1;
+        float m = fminf(hypotf(pad.rx, pad.ry), 1), v = (1.5f + 10 * m) * cfg.cursor_speed / 12.f;
+        fx += pad.rx * v, fy -= pad.ry * v;
+        move_cursor(lroundf(fx), lroundf(fy));
+    }
+    cursor_hidden = n && !free_cursor && !carrying;
+    if (ctl_focus) {
+        ctl_focus = 0;
+        LOG("focus: %d items, focus %ld,%ld-%ld,%ld hidden=%d free=%d carrying=%d", n, focus.left, focus.top, focus.right, focus.bottom, cursor_hidden, free_cursor, carrying);
+        for (int i = 0; i < n; i++) LOG("focus  %d kind=%d %ld,%ld-%ld,%ld", i, f[i].kind, f[i].r.left, f[i].r.top, f[i].r.right, f[i].r.bottom);
+    }
 
     key(VK_LBUTTON, DOWN(A));
     key(VK_RBUTTON, DOWN(X)); // equip / use
@@ -748,10 +896,12 @@ static void update(void) {
     pad.btn &= ~swallow;
     if (menu) {
         cursor_mode = 1, cursor_idle = 0;
-        update_menu(!was_menu), was_menu = 1;
+        if (!was_menu) SetRectEmpty(&focus), free_cursor = ctl_cx >= 0; // (a test-placed cursor stays free)
+        update_menu(), was_menu = 1;
         return;
     }
     was_menu = 0;
+    cursor_hidden = !cursor_mode; // the world has no cursor on the pad; the right stick's manual aim shows it
 
     float m = hypotf(pad.lx, pad.ly);
     if (m > 0.2f) aim_x = pad.lx / m, aim_y = -pad.ly / m, cursor_mode = 0;
@@ -853,10 +1003,10 @@ static void tick(void) {
     if (pad.rt > 0.5f) pad.btn |= BTN_RT;
     pad_shown = pad.btn;
     if (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) pad_mode = 1;
-    if (ctl_cx >= 0) pad_mode = 1, cursor_mode = 1, cursor_idle = 0, move_cursor(ctl_cx, ctl_cy);
+    if (ctl_cx >= 0) pad_mode = 1, cursor_mode = 1, cursor_idle = 0, free_cursor = 1, move_cursor(ctl_cx, ctl_cy);
     static int last_open = -1;
-    if (ui.open != last_open) LOG("ui open=%d windows=%d buttons=%d", ui.open, ui.nwin, ui.nbtn), last_open = ui.open;
-    if (!pad_mode) return;
+    if (ui.open != last_open) LOG("ui open=%d focusables=%d", ui.open, fcount[fpub]), last_open = ui.open;
+    if (!pad_mode) { cursor_hidden = 0; return; }
     update();
     if (pad.btn != prev.btn)
         LOG("pad btn=%04x cur=%ld,%ld hero=%ld,%ld target=%u kind=%d at %ld,%ld", pad.btn, vcur.x, vcur.y,

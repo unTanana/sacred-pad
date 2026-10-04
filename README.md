@@ -49,15 +49,21 @@ Button icons show which button fires which slot (they move to the weapon slots w
 direction drinks which potion, an A above the current target, a red ring on a locked target, and a short
 legend in menus.
 
-In menus, inventory, trade and dialogs:
+There is no cursor in the world: targets get the game's highlight and an A prompt.
+
+In menus, dialogs, the inventory and trade screens, a gold frame marks the focused entry: menu items, buttons,
+dialog answers, inventory items, equipment slots, heroes on the character screen. The game's own hover
+effects and item tooltips show for whatever is focused.
 
 | Input | Action |
 |---|---|
-| Either stick | Cursor (slow near the centre for precision) |
-| D-pad | Jump to the next button that way / one inventory cell |
-| A / X | Left / right click (pick up & place / equip & use) |
-| B, Start | Close |
+| D-pad / left stick | Move focus to the next entry that way (hold to repeat) |
+| A / X | Select / use or equip (left / right click) |
+| B, Start | Back / close |
 | LB / RB | Inventory tabs |
+| Right stick | Free cursor, for anything focus can't reach |
+
+In grids, focus jumps item to item; while an item is picked up it moves cell by cell so you can place it.
 
 The mouse keeps working: moving it hands the cursor back until you touch the pad again.
 
@@ -78,9 +84,8 @@ The mouse keeps working: moving it hands the cursor back until you touch the pad
 
 - Under Wine/Proton the movies (intro, chapter transitions) are skipped: DirectShow crashes there.
 - The game keeps running when it loses focus (it used to freeze).
-- Not verified in a live game: mounting/dismounting (no horse near the test saves; the dismount path is the
-  game's own Shift+click on the ridden horse). The fullscreen main menu may not show the legend/cursor
-  reliably (my screen captures of it were inconsistent); in the world everything was verified fullscreen.
+- Not verified in a live game: mounting/dismounting (no horse near the test saves), and merchant/chest/trade
+  grids (no merchant near the test saves; they use the same generic grid code as the verified backpack).
 - No button remapping yet.
 - `sacredpad.log` next to the game says what the mod did.
 
@@ -90,4 +95,5 @@ The mouse keeps working: moving it hands the cursor back until you touch the pad
 2.0.2.28 exe). `./build.sh` builds with llvm-mingw from `tools/`. The `test/` scripts run a sandboxed,
 DRM-free copy on Hyprland workspace 5 (`test/start.sh new|load|daemon`; `PROTON=1` for Proton, `REAL=1` for
 the real install) and drive it through a control file (`SACREDPAD_CTL`, or
-`sacredpad_ctl.txt` in the game folder) with tokens like `LX=1 A`, `CX=512 CY=288 A`, `LOCK=<ref>`, `FAR`, `DUMP`, `UIDUMP`.
+`sacredpad_ctl.txt` in the game folder) with tokens like `LX=1 A`, `CX=512 CY=288 A`, `LOCK=<ref>`, `FAR`, `DUMP`, `FOCUS` (focus list),
+`UISCAN` (controls found in open windows' memory; `test/uiscan.sh` names their classes).
