@@ -54,7 +54,6 @@ static DWORD (WINAPI *xget)(DWORD, XINPUT_STATE *);
 static int ctl_cx = -1, ctl_cy = -1; // test mode: CX=/CY= put the cursor at an exact client position
 static volatile int ctl_dump;          // test mode: DUMP logs the classified objects around the hero
 static volatile int ctl_far;           // test mode: FAR lifts the target radius / on-screen limit
-static volatile int ctl_key;           // test mode: KEY=<vk> taps a key once
 static volatile int ctl_uidump;        // test mode: UIDUMP logs the visible UI tree
 static volatile unsigned target, locked; // soft target; R3 lock
 static volatile unsigned mount_ref;         // the horse the hero rides (hero +0x1ec), 0 on foot
@@ -89,7 +88,6 @@ static void read_pad(void) {
                 const char *an[] = {"LX", "LY", "RX", "RY", "LT", "RT"};
                 for (int i = 0; i < 6; i++) if (!strcmp(k, an[i])) *ax[i] = v;
                 if (!strcmp(k, "LOCK")) locked = v; // test mode: lock a specific ref
-                if (!strcmp(k, "KEY")) ctl_key = v;
                 if (!strcmp(k, "CX")) ctl_cx = v;
                 if (!strcmp(k, "CY")) ctl_cy = v;
             }
@@ -111,10 +109,12 @@ static void read_pad(void) {
         if (!xget) return;
     }
     XINPUT_STATE s;
-    static int seen = -1;
-    for (DWORD i = 0; i < 4; i++) {
+    static int slot = -1; // the connected pad; empty slots are slow to query, so they are scanned once a second
+    static DWORD rescan;
+    if (slot < 0 && GetTickCount() - rescan < 1000) return;
+    for (int i = slot < 0 ? 0 : slot; i < 4; i++) {
         if (xget(i, &s)) continue;
-        if (seen != (int)i) LOG("xinput: pad %lu connected", i), seen = i;
+        if (slot != i) LOG("xinput: pad %d connected", i), slot = i;
         XINPUT_GAMEPAD *g = &s.Gamepad;
         pad = (Pad){g->sThumbLX / 32767.f, g->sThumbLY / 32767.f, g->sThumbRX / 32767.f, g->sThumbRY / 32767.f,
                     g->bLeftTrigger / 255.f, g->bRightTrigger / 255.f, g->wButtons};
@@ -124,6 +124,7 @@ static void read_pad(void) {
         if (pad.rt < 0.1f) pad.rt = 0;
         return;
     }
+    slot = -1, rescan = GetTickCount();
 }
 
 #define BTN_LT 0x0400 // spare XInput bits: triggers as buttons
@@ -134,7 +135,6 @@ enum { A = XINPUT_GAMEPAD_A, B = XINPUT_GAMEPAD_B, X = XINPUT_GAMEPAD_X, Y = XIN
 
 #define DOWN(b) ((pad.btn & (b)) != 0)
 #define PRESSED(b) (DOWN(b) && !(prev.btn & (b)))
-#define RELEASED(b) (!DOWN(b) && (prev.btn & (b)))
 
 // ---------------------------------------------------------------- virtual mouse/keyboard
 static HWND game;
@@ -308,14 +308,9 @@ static volatile int holding;                // an action button is held: keep th
 static int cursor_idle;                     // ticks since the cursor was last placed by hand
 
 static void update_targets(void *view) {
-    static int dbg;
-    int d = dbg++ < 3;
-    if (d) LOG("ut: view=%p om=%p gs=%p types=%p", view, OM, GAMESTATE, TYPES);
     Obj *h = hero();
-    if (d) LOG("ut: hero=%p", h);
     if (!h) { target = 0; return; }
     measure_view(view);
-    if (d) LOG("ut: g0=%d,%d Ji=%f %f %f %f", g0.x, g0.y, Ji[0], Ji[1], Ji[2], Ji[3]);
     POINT hp = to_screen(h->x, h->y);
     hero_pos = hp;
     mount_ref = *(unsigned *)((BYTE *)h + 0x1ec), hero_level = *(WORD *)((BYTE *)h + 0x3fe);
@@ -329,10 +324,12 @@ static void update_targets(void *view) {
         POINT s = to_screen(o->x, o->y);
         float dx = s.x - hp.x, dy = s.y - hp.y, d = hypotf(dx, dy);
         if (!ctl_far && (d > cfg.target_range || s.x < 8 || s.x > 1015 || s.y < 8 || s.y > 760)) continue; // on screen
+        float c = d > 1 ? (dx * aim_x + dy * aim_y) / d : 1;
+        float score = d + 220 * (1 - c); // cone toward the stick
+        if (score >= best && r != target && r != locked) continue; // can't win: skip the game's (costly) checks
         int k = classify(h, o);
         if (!k || (loot_mode && k != T_ITEM) || (!loot_mode && k == T_ITEM && !cfg.d2r_loot)) continue;
-        float c = d > 1 ? (dx * aim_x + dy * aim_y) / d : 1;
-        float score = d + 220 * (1 - c) + (k == T_ENEMY ? 0 : k == T_ITEM && !loot_mode ? 600 : 400); // cone toward the stick; enemies first
+        score += k == T_ENEMY ? 0 : k == T_ITEM && !loot_mode ? 600 : 400; // enemies first
         if (r == target) score = holding ? -1 : score * 0.75f;      // sticky; fixed while acting
         if (r == locked) score = -2;
         if (score < best) best = score, best_ref = r, best_pos = s, target_kind = k;
@@ -359,8 +356,6 @@ static void update_targets(void *view) {
             if (!o || o == h || !o->sector) continue;
             POINT s = to_screen(o->x, o->y);
             int k = classify(h, o);
-            if (family(o->type) == 2 || family(o->type) == 3 || family(o->type) == 0x20)
-                if (*(int *)((BYTE *)o + 0x1f0) == 4) LOG("dump horse ref=%u screen=%ld,%ld rider=%u", r, s.x, s.y, *(unsigned *)((BYTE *)o + 0x1ec));
             if (k == T_ENEMY || (k && abs(s.x - hp.x) < 4000 && abs(s.y - hp.y) < 4000))
                 LOG("dump ref=%u type=%d kind=%d screen=%ld,%ld hp=%d", r, o->type, k, s.x, s.y, k == T_ENEMY ? *(int *)((BYTE *)o + 0x4d8) : 0);
         }
@@ -388,7 +383,6 @@ static void add_window(Ctl *w, int grid) {
 }
 static void snapshot_ui(void) {
     BYTE *m = UIMGR;
-    int nwin = 0, nbtn = 0;
     ui.nwin = ui.nbtn = 0;
     if (m) {
         Ctl **w = (Ctl **)(m + 0x80);
@@ -407,10 +401,8 @@ static void snapshot_ui(void) {
             }
         }
         ui.dlg = dlg;
-        nwin = ui.nwin, nbtn = ui.nbtn;
     }
-    ui.open = nwin > 0;
-    (void)nbtn;
+    ui.open = ui.nwin > 0;
 }
 
 // The engine's per-frame cursor pass (engine thread). Targeting runs here, before the pass skips its pick
@@ -467,7 +459,7 @@ static void patch_jmp(DWORD at, void *fn) {
 // Glyphs are painted once with GDI into small colour-keyed DirectDraw surfaces, then blitted onto the back
 // buffer right before the game flips (cDxDriver7 0x645e40: +0xb4 IDirectDraw7, +0xbc back buffer).
 enum { G_A, G_B, G_X, G_Y, G_LB, G_RB, G_LT, G_RT, G_UP, G_DOWN, G_LEFT, G_RIGHT, G_RING, G_LOCK,
-       G_MENU_LEGEND, G_WORLD_MENU_LEGEND, G_N };
+       G_MENU_LEGEND, G_MAIN_LEGEND, G_N };
 static IDirectDrawSurface7 *glyph[G_N], *glyph_back;
 static SIZE gsize[G_N];
 
@@ -519,11 +511,11 @@ static int legend_width(HDC dc, const int *gl, const char *const *txt, int n, in
     return x;
 }
 
+// Legends: in-world panels, and the main menu.
+static const int menu_g[] = {G_A, G_X, G_B, G_LB}, main_g[] = {G_A, G_X, G_B};
+static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"}, *const main_t[] = {"Select", "Use", "Back"};
+
 static void paint_glyph(HDC dc, int g, int w, int h) {
-    static const int menu_g[] = {G_A, G_X, G_B, G_LB};
-    static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"};
-    static const int world_g[] = {G_A, G_X, G_B};
-    static const char *const world_t[] = {"Select", "Use", "Back"};
     if (g == G_RING || g == G_LOCK) {
         COLORREF c = g == G_RING ? RGB(255, 214, 90) : RGB(230, 60, 50);
         HPEN pen = CreatePen(PS_SOLID, 3, c), op = SelectObject(dc, pen);
@@ -532,7 +524,7 @@ static void paint_glyph(HDC dc, int g, int w, int h) {
         if (g == G_RING) MoveToEx(dc, w / 2 - 6, h / 2, 0), LineTo(dc, w / 2 + 7, h / 2), MoveToEx(dc, w / 2, h / 2 - 5, 0), LineTo(dc, w / 2, h / 2 + 6);
         SelectObject(dc, op), SelectObject(dc, ob), DeleteObject(pen);
     } else if (g == G_MENU_LEGEND) legend_width(dc, menu_g, menu_t, 4, 1);
-    else if (g == G_WORLD_MENU_LEGEND) legend_width(dc, world_g, world_t, 3, 1);
+    else if (g == G_MAIN_LEGEND) legend_width(dc, main_g, main_t, 3, 1);
     else paint_button(dc, 0, 0, g);
 }
 
@@ -548,16 +540,16 @@ static int make_glyphs(IDirectDraw7 *dd, IDirectDrawSurface7 *back) {
     for (int g = 0; g < G_N; g++) {
         SIZE sz = g < G_LB ? (SIZE){24, 24} : g < G_UP ? (SIZE){30, 22} : g < G_RING ? (SIZE){22, 22}
                 : g <= G_LOCK ? (SIZE){g == G_RING ? 64 : 52, g == G_RING ? 64 : 52} : (SIZE){0, 30};
-        if (!sz.cx) { // legends: measure the text first
-            static const int menu_g[] = {G_A, G_X, G_B, G_LB}, world_g[] = {G_A, G_X, G_B};
-            static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"}, *const world_t[] = {"Select", "Use", "Back"};
-            sz.cx = g == G_MENU_LEGEND ? legend_width(sdc, menu_g, menu_t, 4, 0) : legend_width(sdc, world_g, world_t, 3, 0);
-        }
+        if (!sz.cx) // legends: measure the text first
+            sz.cx = g == G_MENU_LEGEND ? legend_width(sdc, menu_g, menu_t, 4, 0) : legend_width(sdc, main_g, main_t, 3, 0);
         DDSURFACEDESC2 d = {sizeof d};
         d.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
-        d.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY;
+        d.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_VIDEOMEMORY; // GPU blits: system memory costs ~2 ms/frame on wined3d
         d.dwWidth = sz.cx, d.dwHeight = sz.cy, d.ddpfPixelFormat = pf;
-        if (IDirectDraw7_CreateSurface(dd, &d, &glyph[g], NULL)) { LOG("overlay: CreateSurface failed"); break; }
+        if (IDirectDraw7_CreateSurface(dd, &d, &glyph[g], NULL)) {
+            d.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY;
+            if (IDirectDraw7_CreateSurface(dd, &d, &glyph[g], NULL)) { LOG("overlay: CreateSurface failed"); break; }
+        }
         HDC dc;
         if (!IDirectDrawSurface7_GetDC(glyph[g], &dc)) {
             RECT all = {0, 0, sz.cx, sz.cy};
@@ -585,10 +577,8 @@ static void put(IDirectDrawSurface7 *back, int g, int cx, int cy) { // centred o
     if (x + src.right - src.left > 1024) src.right = src.left + 1024 - x;
     if (y + src.bottom - src.top > 768) src.bottom = src.top + 768 - y;
     if (src.right <= src.left || src.bottom <= src.top) return;
-    HRESULT hr = IDirectDrawSurface7_BltFast(back, x, y, glyph[g], &src, DDBLTFAST_SRCCOLORKEY | DDBLTFAST_WAIT);
-    static HRESULT last_hr = 1;
-    if (hr != last_hr) LOG("overlay: BltFast(%p) -> %08lx", (void *)back, hr), last_hr = hr;
-    if (hr == DDERR_SURFACELOST) free_glyphs(); // a mode switch: rebuild next frame
+    if (IDirectDrawSurface7_BltFast(back, x, y, glyph[g], &src, DDBLTFAST_SRCCOLORKEY | DDBLTFAST_WAIT) == DDERR_SURFACELOST)
+        free_glyphs(); // a mode switch: rebuild next frame
 }
 
 // HUD geometry (1024x768): art slots 6..0 grow right from x=670, weapon slots 1..n end at x=362; one slot more at
@@ -600,10 +590,7 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     IDirectDrawSurface7 *ref = *(IDirectDrawSurface7 **)(drv + 0xbc); // glyph format follows the back buffer
     if (ref != glyph_back) free_glyphs(), glyph_back = ref;
     if (!glyph[0] && !make_glyphs(dd, ref)) { busy = 0; return; }
-    int lt = (pad_shown & BTN_LT) != 0, world = hero() && !ui.open;
-    static int last_mode = -1;
-    int mode = !hero() ? 0 : world ? 1 : 2;
-    if (mode != last_mode) LOG("overlay: %s", (const char *[]){"main menu", "world", "panel"}[mode]), last_mode = mode;
+    int lt = (pad_shown & BTN_LT) != 0, in_world = hero() != NULL, world = in_world && !ui.open;
     if (aiming) put(back, G_RING, reticle.x, reticle.y);
     if (cfg.hints && pad_mode) {
         if (world) {
@@ -617,7 +604,10 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
                 put(back, G_A, target_pos.x, target_pos.y - above);
             }
             if (locked && target == locked) put(back, G_LOCK, target_pos.x, target_pos.y);
-        } else put(back, hero() ? G_MENU_LEGEND : G_WORLD_MENU_LEGEND, 12 + gsize[hero() ? G_MENU_LEGEND : G_WORLD_MENU_LEGEND].cx / 2, hero() ? 20 : 748);
+        } else {
+            int g = in_world ? G_MENU_LEGEND : G_MAIN_LEGEND;
+            put(back, g, 12 + gsize[g].cx / 2, in_world ? 20 : 748);
+        }
     }
     busy = 0;
 }
@@ -642,7 +632,6 @@ static void patch_engine(void) { // after the SteamStub has decrypted .text, i.e
     if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) patch_jmp(0x6a0d80, h_movie_open);
     patch_call(0x60ea8a, h_flip);        // world frame present
     patch_call(0x757250, h_flip);        // menu-thread present (main menu)
-    patch_call(0x646b43, h_flip);        // GDI-drawn frames (loading, fullscreen menus)
     patch_call(0x60e9c7, h_cursor_pass); // engine frame loop
     patch_call(0x60ea01, h_cursor_pass);
     patch_call(0x611f64, h_pick_hover);  // hover inside the cursor pass
@@ -704,23 +693,26 @@ static void menu_step(int dx, int dy) {
 static void update_menu(int entered) {
     static float fx, fy;
     static int repeat, tab;
-    static volatile void *last_dlg;
-    if (ui.dlg != last_dlg && (last_dlg = ui.dlg)) { // a dialog appeared: on its OK
-        LOG("warp dialog ok %ld,%ld", ui.ok.x, ui.ok.y);
-        move_cursor(ui.ok.x, ui.ok.y);
+    // A dialog appeared: put the cursor on its OK, and follow the OK while the game is still placing the dialog
+    // (its first position is provisional) unless the player has moved the cursor since.
+    static void *last_dlg;
+    static POINT ok, parked;
+    if (!ui.dlg) last_dlg = NULL;
+    else if (ui.dlg != last_dlg || (vcur.x == parked.x && vcur.y == parked.y && (ui.ok.x != ok.x || ui.ok.y != ok.y))) {
+        last_dlg = (void *)ui.dlg, ok = ui.ok;
+        move_cursor(ok.x, ok.y), parked = vcur;
     }
-    else if (entered && hero()) { // a panel just opened: start on its first button, or its middle
+    if (!ui.dlg && entered && hero()) { // a panel just opened: start on its first button, or its middle
         if (ui.nbtn) move_cursor(ui.btn[0].x, ui.btn[0].y);
         else if (ui.nwin) move_cursor((ui.win[0].left + ui.win[0].right) / 2, (ui.win[0].top + ui.win[0].bottom) / 2);
     }
     float lx = pad.lx + pad.rx, ly = pad.ly + pad.ry, m = fminf(hypotf(lx, ly), 1);
+    if (lroundf(fx) != vcur.x || lroundf(fy) != vcur.y) fx = vcur.x, fy = vcur.y; // moved by something else
     if (m > 0) {
-        if (!fx && !fy) fx = vcur.x, fy = vcur.y;
         float v = (1.5f + 10 * m) * cfg.cursor_speed / 12.f; // slow near the centre for precise aiming
-        fx += lx * v, fy -= ly * v;
+        fx += lx * v, fy -= ly * v; // keeps the fractions: slow pushes still move
         move_cursor(lroundf(fx), lroundf(fy));
     }
-    fx = vcur.x, fy = vcur.y;
 
     static const WORD dirs[] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
     static const int ddx[] = {0, 0, -1, 1}, ddy[] = {-1, 1, 0, 0};
@@ -866,9 +858,6 @@ static void tick(void) {
     if (ui.open != last_open) LOG("ui open=%d windows=%d buttons=%d", ui.open, ui.nwin, ui.nbtn), last_open = ui.open;
     if (!pad_mode) return;
     update();
-    static int last_key;
-    if (ctl_key && ctl_key != last_key) tap(ctl_key);
-    last_key = ctl_key;
     if (pad.btn != prev.btn)
         LOG("pad btn=%04x cur=%ld,%ld hero=%ld,%ld target=%u kind=%d at %ld,%ld", pad.btn, vcur.x, vcur.y,
             hero_pos.x, hero_pos.y, target, target_kind, target_pos.x, target_pos.y);
@@ -945,7 +934,7 @@ static LONG CALLBACK crash_log(EXCEPTION_POINTERS *e) {
     char calls[256] = "", *o = calls;
     for (int i = 0; i < 64 && o < calls + sizeof calls - 12 && !IsBadReadPtr(sp + i, 4); i++)
         if (sp[i] > 0x401000 && sp[i] < 0x890000) o += sprintf(o, " %08lx", sp[i]); // game return addresses (likely)
-    LOG("  stack:%s  pad=%04x ui=%d hero_ok=%d", calls, pad.btn, ui.open, GetModuleHandleA(NULL) != 0);
+    LOG("  stack:%s  pad=%04x ui=%d", calls, pad.btn, ui.open);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

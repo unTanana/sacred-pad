@@ -95,7 +95,9 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
   +0x78/+0x7c children. NPC text dialog = cUI_Tooltip (vtable 0x896b3c) with OK drawn bottom centre.
 - Crash on Start (2026-10-04): UI +0x78 is a child list only on some window classes; walking it blindly on
   the Esc menu followed garbage. All UI pointers are now validated.
-- Present: 0x645e40 (thiscall driver) from 0x60ea8a (world), 0x757250 (menu thread), 0x646b43 (GDI frames).
+- Present: 0x645e40 (thiscall driver) from 0x60ea8a (world), 0x757250 (menu thread). Overlay glyphs live in
+  video memory: system-memory surfaces cost ~2 ms/frame of colour-keyed blits on wined3d (now ~0.2 ms).
+  Targeting + UI snapshot: ~0.09 ms/frame.
   Fullscreen flips the front (+0xb8); mouse singleton `*0xcddb5c`, +4/+8 = cursor sprite position.
 - Hero +0x3fe level (HUD slots: 1 + at levels 2, 8, 16, 30), +0x1ec ridden horse, creature +0x1f0 == 4: horse.
   Dismount = Shift + click whose picked ref is the ridden horse (click handler 0x6172c0).
