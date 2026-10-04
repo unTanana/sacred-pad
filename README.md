@@ -36,18 +36,22 @@ In the world:
 | Hold an art button + right stick | Aim: a ring marks the spot; let go of the art button to cast there |
 | A on a horse / LT + A while riding | Mount / dismount |
 | R3 | Lock / unlock the current target |
-| L3 | Toggle stand-still (Ctrl: attack in place) |
+| L3 | Toggle stand-still: attacks happen in place instead of walking up (the stick still walks) |
 | Right stick | Manual cursor (aims arts at a spot); auto-targeting returns 2 s after you let go |
 | LT + right stick ↑↓ | Zoom |
-| Back / LT + Back | Inventory / map |
-| Start / LT + Start | Game menu / quest log |
+| Start | Panels: inventory first, LB / RB page through the rest (see below) |
+| Back | Map |
+| LT + Start | Quick save (F9; load it from Load Game) |
+| LT + Back (hold) | Minimap |
+
+Holding LT shows a reminder of the LT combinations; stand-still shows an indicator while it's on.
 
 Targeting picks the best enemy in front of where you're steering (enemies first, then NPCs, containers and
 horses), sticks to it while you hold the button, and uses the game's own highlight and info bar.
 
 Button icons show which button fires which slot (they move to the weapon slots while LT is held), which D-pad
-direction drinks which potion, an A above the current target, a red ring on a locked target, and a short
-legend in menus.
+direction drinks which potion, an A above the current target, a red ring on a locked target, and a legend of
+what the buttons do on the current screen.
 
 There is no cursor in the world: targets get the game's highlight and an A prompt.
 
@@ -57,18 +61,28 @@ effects and item tooltips show for whatever is focused.
 
 | Input | Action |
 |---|---|
-| D-pad / left stick | Move focus to the next entry that way (hold to repeat) |
-| A / X | Select / use or equip (left / right click) |
-| B, Start | Back / close |
-| LB / RB | Previous / next tab |
-| Right stick | Free cursor, for anything focus can't reach |
+| D-pad / left stick | Move focus to the next entry that way (hold to repeat); on a slider: change it |
+| A | Select (pick up / place an item) |
+| X | Use / equip (right click) |
+| Y | On a weapon in the backpack: put it on a weapon slot |
+| B | Back / close; in a "Quit?"-style pop-up: Cancel; with an item picked up: put it back |
+| Start | Close the panels |
+| Back | Map |
+| LB / RB | Page: backpack → combat arts → combo → quest log (its four tabs) → game menu → backpack; in a shop: its tabs |
+| Right stick | Free cursor, for anything focus can't reach (the left stick too where nothing is focusable, e.g. the map) |
 
-In grids, focus jumps item to item; while an item is picked up it moves cell by cell so you can place it.
-Tabs (backpack / combat arts / combo, a merchant's weapons / armour / misc) are focus stops above their
-grid; LB / RB switch the tabs of the grid you're in. On the Combat Arts and Combo tabs, focus moves between
-your learned arts and the combo slots. To put one on a button: focus it, press X, then press the button that
-should cast it (X / Y / B / RB / RT; only the slots your level has unlocked). A cancels. Pop-ups ("Load game?", "Quit?") take the focus until
-they close. Merchants, smiths and combat masters are targets in the world: walk toward one and press A.
+Screens start where you'd want them to: the first item of a page, the game menu's Continue, the open quest
+log tab, Cancel in pop-ups, and where you left off when you come back to a menu. Picking a hero moves the focus
+to Start Game, picking a save to Load (or Save, in the game); past the last save, down scrolls the list. Quit
+asks first. NPC conversations keep the focus on their answers. After using the mouse, the first pad press only
+shows the focus again.
+
+In grids, focus jumps item to item; while an item is picked up it moves cell by cell so you can place it, and
+B, Start or Back put it back first (a panel never closes with an item on the cursor). On the Combat Arts and
+Combo pages, A on an art and then the button that should cast it (X / Y / B / RB / RT; only the slots your
+level has unlocked) puts it on the hotbar; Y on a weapon and then a button does the same for the weapon slots
+(LT + that button). A weapon the slot held before goes into free space in the backpack. Merchants, smiths and
+combat masters are targets in the world: walk toward one and press A.
 
 The mouse keeps working: moving it hands the cursor back until you touch the pad again.
 
@@ -89,8 +103,12 @@ The mouse keeps working: moving it hands the cursor back until you touch the pad
 
 - Under Wine/Proton the movies (intro, chapter transitions) are skipped: DirectShow crashes there.
 - The game keeps running when it loses focus (it used to freeze).
-- Not verified in a live game: mounting/dismounting (no horse near the test saves), and merchant/chest/trade
-  grids (no merchant near the test saves; they use the same generic grid code as the verified backpack).
+- Not verified in a live game: mounting/dismounting (no horse near the test saves), chests, multiplayer
+  screens.
+- The quest log's quest entries aren't focus stops yet (the right-stick cursor reaches them).
+- Y only offers weapons (bows and staves included); shields aren't offered for weapon slots.
+- In shops the legend is hidden: the merchant's tabs sit where it would go.
+- The game's own tooltips still say "right mouse button" (X on the pad).
 - No button remapping yet.
 - `sacredpad.log` next to the game says what the mod did.
 

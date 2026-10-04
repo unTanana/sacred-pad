@@ -20,17 +20,17 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 
 | Input | World | Panels |
 |---|---|---|
-| Left stick | Move | Snap cursor between slots |
-| Right stick | Bias/cycle target; aim ground art while held | Free cursor |
-| A | Attack / talk / open / mount (context) | Click (pick/place) |
-| X Y B RB RT | Combat-art slots 1–5 | X use/equip, B close |
-| Hold LT + face/RB/RT | Slots 6–10 | Shift-click |
-| LB (hold) | Target loot only; A picks up | Prev tab |
-| D-pad | Potions | Step one cell |
-| L3 | Stand still | — |
+| Left stick | Move | Move focus |
+| Right stick | Manual cursor; aim ground art while an art button is held | Free cursor |
+| A | Attack / talk / open / mount (context) | Select (pick / place) |
+| X Y B RB RT | Combat-art slots | X use/equip, Y weapon → slot, B back/close |
+| Hold LT + face/RB/RT | Weapon slots | — |
+| LB (hold) | Target loot only; A picks up | LB/RB: page through panels / shop tabs |
+| D-pad | Potions | Move focus |
+| L3 | Stand still (attack in place) | — |
 | R3 | Lock/unlock target | — |
-| View | Map | — |
-| Start | Esc menu | Close |
+| View | Map (LT: minimap while held) | Map |
+| Start | Panels (LT: quick save) | Close |
 
 ## Test rig
 
@@ -74,6 +74,18 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - [x] 4.2 Verified on the real install via Proton 11 (DRM exe, fullscreen): menus + pad input. Needed two Proton fixes
 - [x] 4.3 `sacredpad.ini`: deadzone, cursor speed, target range, hints, d2r_loot, manual-aim timeout
 - [x] 4.4 README (incl. Steam Input: use the "Gamepad" template)
+
+### Phase 5 — D2R layout + friction fixes (from the screen-by-screen audit)
+- [x] 5.1 Start opens the panels; LB/RB cycle backpack → combat arts → combo → quest log tabs → game menu
+- [x] 5.2 Back = map, LT+Back = minimap (hold), LT+Start = quick save; LT legend; stand-still indicator
+- [x] 5.3 Context legends: panel (weapon / art variants), shop, pages, dialog, carrying, assign
+- [x] 5.4 Initial focus per screen: remembered → Continue → open quest tab → Cancel in pop-ups → first item/art
+- [x] 5.5 Follow-ups: hero → Start Game, save → Load/Save; Quit asks; per-campaign pedestals
+- [x] 5.6 Sliders (tenth steps via the track), save list scrolls past its ends
+- [x] 5.7 Carry safety (B/Start/Back put back; never close with an item on the cursor); Y: weapon → weapon slot
+- [x] 5.8 NPC conversations hold the focus; pop-ups and merchant message boxes too
+- [x] 5.9 Waking the pad after the mouse only shows the focus; stand-still no longer blocks walking
+- [ ] Quest log entries as focus stops (struct offsets didn't match the decompile)
 
 ## Findings
 - SteamStub Variant 2.0; Steamless unpacks it. `.text` is decrypted by the time `CreateWindowExA` runs, so code
@@ -126,3 +138,16 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
   move, click the slot. The game needs to see the cursor arrive on the slot before the drop click (~50 ms).
 - Keys (manual): LMB move/attack/open/talk, RMB use selected art, 1-5 weapon slots, 6-0 art slots,
   Space/Q/W/E/R potions, I inventory, M map, L log, A collect all, Alt names, Ctrl+click attack in place.
+- Hotkeys (Quickstart.pdf): Tab minimap (polled: hold), F8/F9 quick load/save (GAME00.PAK "QUICKSAVE"),
+  F combat arts, C combo, O options, S save menu, H help, P pause, B heal hirelings.
+- Windows (cUI_Manager +0x80 slot): 1 inventory, 2 equipment, 4 merchant, 5 map, 10 quest log, 11 save/load,
+  12 game menu, 13 merchant message box, 20 hero select; the main menu's own save / hero screens at +0x13c / +0x134.
+- Quest log (cUI_Diary): tab controls at +0x538 (0x7c apart), open tab +0x7a4.
+- Sliders (vtable 0x897664, render 0x752ee0): arrows +0x94/+0x110, track +0x18c, knob +0x208 (all cUI controls).
+  A track click centres the knob on the click; holding an arrow repeats.
+- Grid cells (entry +0x18, 12 bytes): +0 item ref at the item's top-left cell only, +5/+6 its size in cells.
+  Type family 5 = weapons (incl. bows, staves); 6 body armour, 9 potions, 17 helmets, 19 belts, 20 amulets,
+  21 spurs, 22 bracers, 24 gauntlets, 25 wings, 28 combat-art books, 33 shoulder armour.
+- Dropping onto an occupied hotbar weapon slot swaps: the slot's old item ends up on the cursor. The game
+  accepts non-weapons there too (and unequips the current weapon), so the pad only offers weapons.
+- Confirmation pop-ups share one layout ("Load game?", "Quit game?", "Overwrite?"): focus memory must not apply.

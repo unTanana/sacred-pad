@@ -82,7 +82,11 @@ static volatile POINT reticle;
 // one slot at level 1, another at levels 2, 8, 16 and 30.
 static POINT art_slot(int i) { return (POINT){670 + 67 * i, 716}; }
 static int art_slots(void) { int l = hero_level; return 1 + (l >= 2) + (l >= 8) + (l >= 16) + (l >= 30); }
-static volatile int assigning; // X on a combat art: the next X/Y/B/RB/RT puts it on that slot, A cancels
+// Weapon slots (keys 1..5, pad LT + X Y B RB RT) mirror them: they end at x = 362.
+static POINT weapon_slot(int i) { return (POINT){362 - 67 * (art_slots() - 1 - i), 716}; }
+static volatile int assigning;   // X on an art / Y on an item: the next X/Y/B/RB/RT puts it on that slot, A cancels
+static volatile int assign_kind; // 1: art -> art slot, 2: item -> weapon slot
+static volatile int focus_kind = -1, focus_tag; // of the focused entry (for the legend)
 
 static const struct { const char *name; WORD bit; } btn_names[] = {
     {"UP", XINPUT_GAMEPAD_DPAD_UP}, {"DOWN", XINPUT_GAMEPAD_DPAD_DOWN}, {"LEFT", XINPUT_GAMEPAD_DPAD_LEFT},
@@ -360,6 +364,8 @@ static volatile int walk_only;              // left stick walking: clicks are pl
 static volatile int force = -1;             // what clicks pick: -1 the game decides, 0 ground, else this ref
 static volatile int cursor_mode;            // right stick in use: the game picks under the cursor as usual
 static volatile int holding;                // an action button is held: keep the target while it is valid
+static volatile int steering;               // the left stick is pushed
+static volatile int stand;                  // L3: stand still (attacks don't walk up to the target)
 static int cursor_idle;                     // ticks since the cursor was last placed by hand
 
 static void update_targets(void *view) {
@@ -380,13 +386,13 @@ static void update_targets(void *view) {
         float dx = s.x - hp.x, dy = s.y - hp.y, d = hypotf(dx, dy);
         if (!ctl_far && (d > cfg.target_range || s.x < 8 || s.x > 1015 || s.y < 8 || s.y > 760)) continue; // on screen
         float c = d > 1 ? (dx * aim_x + dy * aim_y) / d : 1;
-        float score = d + 220 * (1 - c); // cone toward the stick
+        float score = d + 400 * (1 - c); // cone toward the stick
         if (score >= best && r != target && r != locked) continue; // can't win: skip the game's (costly) checks
         int k = classify(h, o);
         if (!k || (loot_mode && k != T_ITEM) || (!loot_mode && k == T_ITEM && !cfg.d2r_loot)) continue;
         static const float penalty[] = {0, 0, 250, 400, 600}; // enemies, then people, then objects, loot last
         score += k == T_ITEM && loot_mode ? 0 : penalty[k];
-        if (r == target) score = holding ? -1 : score * 0.75f;      // sticky; fixed while acting
+        if (r == target) score = holding ? -1 : score * (steering ? 0.9f : 0.75f); // sticky; fixed while acting
         if (r == locked) score = -2;
         if (score < best) best = score, best_ref = r, best_pos = s, target_kind = k;
     }
@@ -413,27 +419,37 @@ static void update_targets(void *view) {
 // Clickable controls are recorded as the game draws them (their render, vtable slot 5, is hooked per class), so the
 // list is exactly what is on screen: hidden pages, tabs and closed windows never draw. Item grids come from the
 // inventory data. The list is built on the render thread and published at each present.
-typedef struct { RECT r; int kind; } Focus;
-enum { F_CTL, F_ITEM, F_ART }; // F_ITEM: an item in a grid (new screens start there); F_ART: can go on the hotbar
+typedef struct { RECT r; short kind, tag; POINT a, b; } Focus; // a/b: where a click decreases / increases a slider
+enum { F_CTL, F_ITEM, F_ART, F_SLIDER }; // F_ITEM: an item in a grid (new screens start there); F_ART: a combat art
+enum { TG_NONE, TG_QUIT, TG_PREF, TG_ANCARIA, TG_UNDERWORLD, TG_EDIT, TG_PEDESTAL, TG_WEAPON }; // what an entry is
 #define MAXF 256
 static Focus fbuf[2][MAXF];
 static volatile int fpub, fcount[2]; // fbuf[fpub] is the published list, fbuf[!fpub] is being built
-static volatile int fmodal[2];       // the list belongs to a confirmation pop-up (focus starts afresh there)
+static volatile int fmodal[2];       // the list belongs to 1: a confirmation pop-up, 2: an NPC conversation
 static volatile int carrying;        // an item hangs on the cursor (mouse +0x68)
+static volatile DWORD wins;          // visible windows: bit i = cUI_Manager window slot i (11 save/load, 20 heroes)
+static volatile int diary_tab;       // the quest log's open tab
+static RECT diary_tabs[4];           // ... and where its four tabs are
+static volatile int campaign_uw;     // the hero screen was opened for the Underworld campaign
 static volatile int legend_covered; // an open window reaches into the top-left corner where the menu legend goes
 static volatile POINT npc_ok;        // the only answer of an open NPC dialog (OK), for B; x < 0 when none
 static RECT focus;                   // current menu focus; empty = none
 static int free_cursor;              // the right stick took over in a menu
 static volatile int cursor_hidden;   // the pad drives: the game does not draw its cursor
 
-static void add_focus(RECT r, int kind) {
+static Focus *add_focus(RECT r, int kind, int tag) {
     int w = !fpub, n = fcount[w];
-    if (n >= MAXF || r.right <= r.left || r.bottom <= r.top) return;
-    for (int i = 0; i < n; i++) { // text is drawn twice (shadow pass, a few pixels off): keep one
+    if (n >= MAXF || r.right <= r.left || r.bottom <= r.top) return NULL;
+    for (int i = 0; i < n; i++) {
         RECT *o = &fbuf[w][i].r;
-        if (abs(o->left - r.left) <= 8 && abs(o->top - r.top) <= 8 && o->right - o->left == r.right - r.left) return;
+        if (abs(o->left - r.left) <= 8 && abs(o->top - r.top) <= 8 && o->right - o->left == r.right - r.left)
+            return NULL; // text is drawn twice (shadow pass, a few pixels off): keep one
+        if (tag == TG_EDIT && fbuf[w][i].tag == TG_EDIT && o->left == r.left && o->right == r.right &&
+            r.top - o->bottom < 14 && o->top - r.bottom < 14)
+            return UnionRect(o, o, &r), NULL; // a save's name / file / date fields: one row
     }
-    fbuf[w][n] = (Focus){r, kind}, fcount[w] = n + 1;
+    fbuf[w][n] = (Focus){r, kind, tag}, fcount[w] = n + 1;
+    return &fbuf[w][n];
 }
 
 static const struct { DWORD vt; int cmd; } clickable[] = { // cmd: offset of the command a click runs, 0 = any
@@ -449,8 +465,12 @@ static void __fastcall h_render(Ctl *c, void *edx, void *dev) {
         // Not the HUD: the taskbar, the party portraits, and the compass potions (parentless 32x32 buttons that
         // stay up in the world; screens like the character select and the save menu use parentless buttons too).
         if (root->vt != (void **)0x896ac0 && root->vt != (void **)0x8968cc && !(root == c && c->w <= 34 && c->h <= 34)) {
+            static const struct { const char *name; int tag; } named[] = {{"UI_LABEL_QUIT", TG_QUIT},
+                {"UI_ESC_CONTINUE", TG_PREF}, {"UI_LABEL_NEWGAME", TG_ANCARIA}, {"UI_LABEL_NEWADDON", TG_UNDERWORLD}};
+            int tag = c->vt == (void **)0x897534 ? TG_EDIT : TG_NONE;
+            for (unsigned k = 0; k < sizeof named / sizeof *named; k++) if (!strcmp(c->name, named[k].name)) tag = named[k].tag;
             POINT p = ctl_pos(c);
-            add_focus((RECT){p.x, p.y, p.x + c->w, p.y + c->h}, F_CTL);
+            add_focus((RECT){p.x, p.y, p.x + c->w, p.y + c->h}, F_CTL, tag);
         }
     }
     render_orig[i](c, edx, dev);
@@ -462,6 +482,10 @@ static volatile RECT sheets[4];
 static volatile int nsheets, sheet_tab[4]; // sheet_tab: the tab shown (tab control at +0x78, index at +0x84)
 static RECT pub_sheets[4];
 static volatile int pub_nsheets, pub_sheet_tab[4];
+static int inventory_sheet(void) { // the inventory's tab sheet (the lower one when a merchant shows its own too)
+    for (int i = 0; i < pub_nsheets; i++) if (pub_sheets[i].top > 300) return i;
+    return -1;
+}
 static void (__fastcall *sheet_render)(void *, void *, void *) = (void *)0x7297f0;
 static void __fastcall h_sheet_render(Ctl *c, void *edx, void *dev) {
     if ((c->flags & 1) && nsheets < 4) {
@@ -470,7 +494,7 @@ static void __fastcall h_sheet_render(Ctl *c, void *edx, void *dev) {
         sheet_tab[nsheets] = tc && !IsBadReadPtr(tc + 0x84, 2) ? *(WORD *)(tc + 0x84) % 3 : 0;
         sheets[nsheets++] = (RECT){p.x, p.y - 26, p.x + c->w, p.y + c->h};
         static const int tab_x[] = {73, 229, 391};
-        for (int i = 0; i < 3; i++) add_focus((RECT){p.x + tab_x[i] - 70, p.y - 38, p.x + tab_x[i] + 70, p.y - 14}, F_CTL);
+        for (int i = 0; i < 3; i++) add_focus((RECT){p.x + tab_x[i] - 70, p.y - 38, p.x + tab_x[i] + 70, p.y - 14}, F_CTL, 0);
     }
     sheet_render(c, edx, dev);
 }
@@ -482,7 +506,7 @@ static void __fastcall h_spell_render(Ctl *c, void *edx, void *dev) {
     BYTE *b = *(BYTE **)((BYTE *)c + 0x2cc), *e = *(BYTE **)((BYTE *)c + 0x2d0);
     if ((c->flags & 1) && b && e > b && e - b <= 64 * 16 && !IsBadReadPtr(b, e - b))
         for (; b < e; b += 16)
-            if (*b & 1) add_focus((RECT){*(short *)(b + 4), *(short *)(b + 6), *(short *)(b + 4) + 64, *(short *)(b + 6) + 64}, F_ART);
+            if (*b & 1) add_focus((RECT){*(short *)(b + 4), *(short *)(b + 6), *(short *)(b + 4) + 64, *(short *)(b + 6) + 64}, F_ART, 0);
     spell_render(c, edx, dev);
 }
 static void (__fastcall *combo_render)(void *, void *, void *) = (void *)0x6bf6f0;
@@ -491,9 +515,36 @@ static void __fastcall h_combo_render(Ctl *c, void *edx, void *dev) {
         for (Ctl **k = (Ctl **)((BYTE *)c + 0x154); k <= (Ctl **)((BYTE *)c + 0x160); k++)
             if (ctl_ok(*k)) {
                 POINT p = ctl_pos(*k);
-                add_focus((RECT){p.x, p.y, p.x + (*k)->w, p.y + (*k)->h}, F_ART);
+                add_focus((RECT){p.x, p.y, p.x + (*k)->w, p.y + (*k)->h}, F_ART, 0);
             }
     combo_render(c, edx, dev);
+}
+
+// Sliders (cUI_Scrollbar: the volume and map-transparency bars, the save list's scroll bar): two embedded arrow
+// buttons at +0x94 / +0x110 step the value; the pad clicks them (or the track, see below).
+static void (__fastcall *slider_render)(void *, void *, void *) = (void *)0x752ee0;
+static void __fastcall h_slider_render(Ctl *c, void *edx, void *dev) {
+    if ((c->flags & 5) == 5) {
+        POINT p = ctl_pos(c), arrow[2];
+        for (int i = 0; i < 2; i++) {
+            Ctl *a = (Ctl *)((BYTE *)c + (i ? 0x110 : 0x94));
+            POINT q = ctl_pos(a);
+            arrow[i] = (POINT){q.x + a->w / 2, q.y + a->h / 2};
+        }
+        Focus *f = add_focus((RECT){p.x, p.y, p.x + c->w, p.y + c->h}, F_SLIDER, 0);
+        if (f) f->a = arrow[0], f->b = arrow[1];
+        // A horizontal slider steps by a tenth of its range instead (an arrow click barely moves it): a click on its
+        // track (+0x18c) centres the knob (+0x208) there, so the step points sit beside the knob, clear of it.
+        Ctl *track = (Ctl *)((BYTE *)c + 0x18c), *knob = (Ctl *)((BYTE *)c + 0x208);
+        if (f && c->w > c->h && track->w > knob->w) {
+            POINT t = ctl_pos(track), k = ctl_pos(knob);
+            int kc = k.x + knob->w / 2, step = (track->w - knob->w) / 10, y = t.y + track->h / 2;
+            if (step < knob->w / 2 + 2) step = knob->w / 2 + 2;
+            f->a = (POINT){kc - step > t.x ? kc - step : t.x + 1, y};
+            f->b = (POINT){kc + step < t.x + track->w - 1 ? kc + step : t.x + track->w - 2, y};
+        }
+    }
+    slider_render(c, edx, dev);
 }
 
 // The confirmation pop-up's draw (cUI_BusyDlg, vtable slot 5): what is recorded after it starts is the pop-up's.
@@ -506,6 +557,7 @@ static void __fastcall h_busy_render(void *dlg, void *edx, void *dev) {
 static void hook_renders(void) { // vtable slot 5 = render(dev)
     patch_ptr((void **)0x897134 + 5, h_busy_render), patch_ptr((void **)0x897258 + 5, h_sheet_render);
     patch_ptr((void **)0x896610 + 5, h_spell_render), patch_ptr((void **)0x896578 + 5, h_combo_render);
+    patch_ptr((void **)0x897664 + 5, h_slider_render);
     for (int i = 0; clickable[i].vt; i++) render_orig[i] = patch_ptr((void **)clickable[i].vt + 5, h_render);
 }
 
@@ -523,29 +575,61 @@ static void __fastcall h_grid_draw(BYTE *entry, void *edx, void *dev, int flag) 
     if (n < 8) grids[n] = entry, ngrids = n + 1;
     grid_draw(entry, edx, dev, flag);
 }
+
+// The backpack's biggest empty square (centre, size in cells): where an item left on the cursor goes (a weapon
+// swapped out of a hotbar slot, or one that doesn't fit back where it came from).
+static volatile POINT free_spot = {-1, -1};
+static int spot_size;
+static POINT spot;
 static void add_grid(BYTE *e) {
     int gw = *(WORD *)(e + 0x115c), gh = *(WORD *)(e + 0x115e), x0 = *(short *)(e + 0x1164), y0 = *(short *)(e + 0x1166);
     if (gw <= 0 || gh <= 0 || gw * gh > 256) return;
+    int sh = inventory_sheet();
+    if (sh >= 0 && PtInRect(&pub_sheets[sh], (POINT){x0 + 1, y0 + 1})) { // the backpack (cells: +0 item at its top-left)
+        BYTE occ[256] = {0}, sq[256];
+        for (int i = 0; i < gw * gh; i++) {
+            BYTE *c = e + 0x18 + i * 12;
+            for (int y = 0; *(int *)c && y < c[6]; y++)
+                for (int x = 0; x < c[5]; x++)
+                    if (i % gw + x < gw && i / gw + y < gh) occ[i + y * gw + x] = 1;
+        }
+        for (int i = gw * gh - 1; i >= 0; i--) {
+            int last = i % gw == gw - 1 || i / gw == gh - 1, m = last ? 0 : sq[i + 1] < sq[i + gw] ? sq[i + 1] : sq[i + gw];
+            if (!last && sq[i + gw + 1] < m) m = sq[i + gw + 1];
+            sq[i] = occ[i] ? 0 : 1 + m;
+            if (sq[i] >= spot_size) spot_size = sq[i], spot = (POINT){x0 + i % gw * 32 + sq[i] * 16, y0 + i / gw * 32 + sq[i] * 16};
+        }
+    }
     for (int i = 0; i < gw * gh; i++) {
         BYTE *cell = e + 0x18 + i * 12;
         RECT r = {x0 + i % gw * 32, y0 + i / gw * 32, x0 + i % gw * 32 + 32, y0 + i / gw * 32 + 32};
-        if (carrying) add_focus(r, F_CTL); // placing: every cell
-        else if (*(int *)cell) r.right = r.left + 32 * cell[5], r.bottom = r.top + 32 * cell[6], add_focus(r, F_ITEM);
+        if (carrying) add_focus(r, F_CTL, 0); // placing: every cell
+        else if (*(int *)cell) { // +0 the item's ref, +5/+6 its size in cells
+            Obj *o = obj(*(unsigned *)cell);
+            r.right = r.left + 32 * cell[5], r.bottom = r.top + 32 * cell[6];
+            add_focus(r, F_ITEM, o && family(o->type) == 5 ? TG_WEAPON : 0); // family 5: weapons (bows and staves too)
+        }
     }
 }
 static void snapshot_ui(void) {
     BYTE *m = UIMGR, *mouse = *(BYTE **)0xcddb5c;
     int open = 0, answers = 0;
     POINT ok = {-1, -1};
+    RECT ans[4];
     carrying = mouse && *(int *)(mouse + 0x68);
     if (m) {
         Ctl **w = (Ctl **)(m + 0x80);
         int covered = 0;
+        DWORD vis = 0;
         for (int i = 0; i < 23; i++) // not the taskbar (0), party portraits (7) or slot 19: they are always up
             if (i != 0 && i != 7 && i != 19 && ctl_ok(w[i]) && (w[i]->flags & 1)) {
                 POINT p = ctl_pos(w[i]);
-                open = 1, covered |= p.x < 440 && p.y < 40 && w[i]->w > 0 && w[i]->h > 0; // e.g. a merchant's tabs
+                open = 1, vis |= 1u << i, covered |= p.x < 440 && p.y < 40 && w[i]->w > 0 && w[i]->h > 0; // e.g. a merchant's tabs
             }
+        Ctl *menu_save = *(Ctl **)(m + 0x13c), *menu_heroes = *(Ctl **)(m + 0x134); // the main menu's own copies
+        if (ctl_ok(menu_save) && (menu_save->flags & 1)) vis |= 1u << 11;
+        if (ctl_ok(menu_heroes) && menu_heroes->vt == (void **)0x896fa8 && (menu_heroes->flags & 1)) vis |= 1u << 20;
+        wins = vis;
         legend_covered = covered;
         Ctl **end, **d = dialogs(m, &end);
         for (; d && d < end; d++)
@@ -556,24 +640,41 @@ static void snapshot_ui(void) {
                     for (BYTE *a = (BYTE *)*d + 0x2180; a < (BYTE *)*d + 0x2180 + 4 * 0x14; a += 0x14) {
                         int x = *(int *)(a + 4), y = *(int *)(a + 8), aw = *(short *)(a + 0xc), ah = *(short *)(a + 0xe);
                         if (aw > 0 && ah > 0)
-                            add_focus((RECT){p.x + x, p.y + y, p.x + x + aw, p.y + y + ah}, F_CTL),
-                            ok = (POINT){p.x + x + aw / 2, p.y + y + ah / 2}, answers++;
+                            ans[answers++] = (RECT){p.x + x, p.y + y, p.x + x + aw, p.y + y + ah},
+                            ok = (POINT){p.x + x + aw / 2, p.y + y + ah / 2};
                     }
                 }
             }
-        // Character select / import: the heroes stand on eight pedestals (3D models, not controls).
-        Ctl *ch = ctl_ok(w[20]) ? w[20] : *(Ctl **)(m + 0x134); // in the world / from the main menu
-        if (ctl_ok(ch) && ch->vt == (void **)0x896fa8 && (ch->flags & 1)) {
-            static const POINT pedestal[] = {{100, 470}, {216, 360}, {380, 400}, {524, 440}, {630, 340}, {730, 420}, {810, 350}, {890, 480}};
-            for (int i = 0; i < 8; i++) add_focus((RECT){pedestal[i].x - 30, pedestal[i].y - 60, pedestal[i].x + 30, pedestal[i].y + 60}, F_CTL);
+        // Hero select / import: the heroes stand on eight pedestals (3D models, not controls), placed differently in
+        // the two campaigns' scenes. Points measured by hovering each (the game highlights the slot).
+        if (vis & 1u << 20) {
+            static const POINT pedestal[2][8] = {
+                {{100, 470}, {216, 360}, {380, 400}, {524, 440}, {630, 340}, {730, 420}, {810, 350}, {890, 480}},
+                {{95, 466}, {220, 350}, {360, 360}, {528, 416}, {630, 340}, {718, 396}, {806, 416}, {906, 600}}};
+            const POINT *pt = pedestal[campaign_uw != 0];
+            for (int i = 0; i < 8; i++) add_focus((RECT){pt[i].x - 30, pt[i].y - 60, pt[i].x + 30, pt[i].y + 60}, F_CTL, TG_PEDESTAL);
         }
+        // The quest log (cUI_Diary) draws its four tab icons from embedded controls at +0x538 (0x7c apart); the open
+        // tab is +0x7a4. ponytail: the quest entries themselves aren't decoded yet (right stick reaches them).
+        if (vis & 1u << 10) {
+            BYTE *dy = (BYTE *)w[10];
+            for (int i = 0; i < 4; i++) {
+                Ctl *t = (Ctl *)(dy + 0x538 + i * 0x7c);
+                POINT p = ctl_pos(t);
+                diary_tabs[i] = (RECT){p.x, p.y, p.x + t->w, p.y + 64};
+                add_focus(diary_tabs[i], F_CTL, 0);
+            }
+            diary_tab = *(WORD *)(dy + 0x7a4);
+        }
+        spot_size = 0;
         for (int i = 0; i < ngrids; i++) add_grid(grids[i]);
+        free_spot = spot_size ? spot : (POINT){-1, -1};
         Ctl *eq = w[2];
         if (ctl_ok(eq) && (eq->flags & 1)) // equipment slots: the UI_EQ_* controls at cUI_Equipment +0x15c..+0x1a0
             for (Ctl **slot = (Ctl **)((BYTE *)eq + 0x15c); slot <= (Ctl **)((BYTE *)eq + 0x1a0); slot++)
                 if (ctl_ok(*slot) && ((*slot)->flags & 1)) {
                     POINT p = ctl_pos(*slot);
-                    add_focus((RECT){p.x, p.y, p.x + (*slot)->w, p.y + (*slot)->h}, F_CTL);
+                    add_focus((RECT){p.x, p.y, p.x + (*slot)->w, p.y + (*slot)->h}, F_CTL, 0);
                 }
     }
     // A confirmation pop-up (cUI_BusyDlg: Quit? Load game? ...) is modal: only what it drew is focusable.
@@ -582,6 +683,20 @@ static void snapshot_ui(void) {
         int k = modal_mark, n = fcount[nb] - k;
         memmove(fbuf[nb], fbuf[nb] + k, (n > 0 ? n : 0) * sizeof *fbuf[nb]);
         fcount[nb] = n > 0 ? n : 0, open = 1, modal_mark = -1;
+    }
+    // A merchant's message box (cUI_Purchase, window 13: "You do not have enough gold!") is modal too; its buttons
+    // are 12-byte screen rects at +0x160, +0x16c, +0x178 (x, y ints, w, h shorts).
+    Ctl *buy = m ? ((Ctl **)(m + 0x80))[13] : NULL;
+    if (ctl_ok(buy) && (buy->flags & 1)) {
+        fcount[nb] = 0, modal = 1, open = 1;
+        for (BYTE *r = (BYTE *)buy + 0x160; r <= (BYTE *)buy + 0x178; r += 12) {
+            int x = *(int *)r, y = *(int *)(r + 4), bw = *(short *)(r + 8), bh = *(short *)(r + 10);
+            if (bw > 0 && bh > 0 && x >= 0 && y >= 0 && x < 1024 && y < 768) add_focus((RECT){x, y, x + bw, y + bh}, F_CTL, 0);
+        }
+    }
+    if (answers && !modal) { // an NPC conversation (answers drawn by the dialog itself) holds the focus as well
+        fcount[nb] = 0, modal = 2;
+        for (int i = 0; i < answers; i++) add_focus(ans[i], F_CTL, 0);
     }
     fmodal[nb] = modal;
     ui_open = open;
@@ -628,8 +743,10 @@ static int __cdecl h_movie_open(void *a, void *b, void **stream) { return *strea
 // ---------------------------------------------------------------- overlay: button icons and the aim marker
 // Glyphs are painted once with GDI into small colour-keyed DirectDraw surfaces, then blitted onto the back
 // buffer right before the game flips (cDxDriver7 0x645e40: +0xb4 IDirectDraw7, +0xbc back buffer).
-enum { G_A, G_B, G_X, G_Y, G_LB, G_RB, G_LT, G_RT, G_UP, G_DOWN, G_LEFT, G_RIGHT, G_RING, G_LOCK,
-       G_MENU_LEGEND, G_MAIN_LEGEND, G_ASSIGN_LEGEND, G_N };
+enum { G_A, G_B, G_X, G_Y, G_LB, G_RB, G_LT, G_RT, G_L3, G_RS, G_START, G_BACK, G_UP, G_DOWN, G_LEFT, G_RIGHT,
+       G_RING, G_LOCK, G_LEGEND }; // then one glyph per legend
+enum { L_PANEL, L_WEAPON, L_ARTS, L_SHOP, L_PAGES, L_SELECT, L_CARRY, L_ASSIGN, L_LT, L_STAND, L_N };
+#define G_N (G_LEGEND + L_N)
 static IDirectDrawSurface7 *glyph[G_N], *glyph_back;
 static SIZE gsize[G_N];
 static DWORD frame_colour; // the focus frame's gold in the back buffer's pixel format
@@ -637,7 +754,7 @@ static const int art_g[] = {G_X, G_Y, G_B, G_RB, G_RT}; // the buttons of art sl
 
 static void paint_button(HDC dc, int x, int y, int g) { // one button icon with its top-left at x, y
     static const COLORREF face[] = {RGB(60, 176, 67), RGB(214, 56, 46), RGB(47, 120, 222), RGB(240, 192, 0)};
-    static const char *label[] = {"A", "B", "X", "Y", "LB", "RB", "LT", "RT"};
+    static const char *label[] = {"A", "B", "X", "Y", "LB", "RB", "LT", "RT", "L3", "RS", "", ""};
     HPEN pen = CreatePen(PS_SOLID, 2, RGB(20, 20, 20)), op = SelectObject(dc, pen);
     HFONT font = CreateFontA(g < G_LB ? -15 : -11, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Tahoma");
     HFONT of = SelectObject(dc, font);
@@ -657,6 +774,12 @@ static void paint_button(HDC dc, int x, int y, int g) { // one button icon with 
     if (g < G_UP) {
         SetBkMode(dc, TRANSPARENT), SetTextColor(dc, g == G_Y ? RGB(30, 30, 30) : RGB(255, 255, 255));
         DrawTextA(dc, label[g], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    if (g == G_START) // Menu: three lines
+        for (int i = 0; i < 3; i++) PatBlt(dc, x + 9, y + 6 + 4 * i, 12, 2, WHITENESS);
+    if (g == G_BACK) { // View: two overlapping windows
+        SelectObject(dc, GetStockObject(WHITE_PEN)), SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, x + 8, y + 5, x + 18, y + 13), Rectangle(dc, x + 12, y + 9, x + 22, y + 17);
     }
     SelectObject(dc, op), SelectObject(dc, of), SelectObject(dc, ob);
     DeleteObject(pen), DeleteObject(font), DeleteObject(br);
@@ -683,11 +806,21 @@ static int legend_width(HDC dc, const int *gl, const char *const *txt, int n, in
     return x;
 }
 
-// Legends: in-world panels, and the main menu.
-static const int menu_g[] = {G_A, G_X, G_B, G_LB}, main_g[] = {G_A, G_X, G_B};
-static const char *const menu_t[] = {"Select", "Use / equip", "Back", "/ RB  tabs"}, *const main_t[] = {"Select", "Use", "Back"};
-static const int assign_g[] = {G_X, G_A};
-static const char *const assign_t[] = {"Y  B  RB  RT: put this art on that button", "Cancel"};
+// Legends: what the buttons do right now, top-left (the main menu's at the bottom).
+static const struct { int n, g[6]; const char *t[6]; } legends[L_N] = {
+    [L_PANEL] = {4, {G_A, G_X, G_B, G_LB}, {"Select", "Use / equip", "Close", "/ RB  pages"}},
+    [L_WEAPON] = {5, {G_A, G_X, G_Y, G_B, G_LB}, {"Select", "Equip", "Put on a button", "Close", "/ RB  pages"}},
+    [L_ARTS] = {3, {G_A, G_B, G_LB}, {"Put on a button", "Close", "/ RB  pages"}},
+    [L_SHOP] = {4, {G_A, G_X, G_B, G_LB}, {"Select", "Use / equip", "Close", "/ RB  shop tabs"}},
+    [L_PAGES] = {3, {G_A, G_B, G_LB}, {"Select", "Close", "/ RB  pages"}},
+    [L_SELECT] = {2, {G_A, G_B}, {"Select", "Back"}}, // menus, dialogs
+    [L_CARRY] = {2, {G_A, G_B}, {"Place", "Put back"}},
+    [L_ASSIGN] = {2, {G_X, G_A}, {"Y  B  RB  RT: put it on that button", "Cancel"}},
+    [L_LT] = {6, {G_LT, G_START, G_BACK, G_UP, G_A, G_RS},
+              {"held:", "Quick save", "Minimap (hold)", "Mentor potion", "Dismount", "Zoom"}},
+    [L_STAND] = {1, {G_L3}, {"Standing still"}},
+};
+#define LEGEND(dc, l, paint) legend_width(dc, legends[l].g, legends[l].t, legends[l].n, paint)
 
 static void paint_glyph(HDC dc, int g, int w, int h) {
     if (g == G_RING || g == G_LOCK) {
@@ -697,9 +830,7 @@ static void paint_glyph(HDC dc, int g, int w, int h) {
         Ellipse(dc, 2, 2 + h / 4, w - 2, h - 2 - h / 4); // flat ellipse: a circle on the isometric ground
         if (g == G_RING) MoveToEx(dc, w / 2 - 6, h / 2, 0), LineTo(dc, w / 2 + 7, h / 2), MoveToEx(dc, w / 2, h / 2 - 5, 0), LineTo(dc, w / 2, h / 2 + 6);
         SelectObject(dc, op), SelectObject(dc, ob), DeleteObject(pen);
-    } else if (g == G_MENU_LEGEND) legend_width(dc, menu_g, menu_t, 4, 1);
-    else if (g == G_MAIN_LEGEND) legend_width(dc, main_g, main_t, 3, 1);
-    else if (g == G_ASSIGN_LEGEND) legend_width(dc, assign_g, assign_t, 2, 1);
+    } else if (g >= G_LEGEND) LEGEND(dc, g - G_LEGEND, 1);
     else paint_button(dc, 0, 0, g);
 }
 
@@ -715,9 +846,7 @@ static int make_glyphs(IDirectDraw7 *dd, IDirectDrawSurface7 *back) {
     for (int g = 0; g < G_N; g++) {
         SIZE sz = g < G_LB ? (SIZE){24, 24} : g < G_UP ? (SIZE){30, 22} : g < G_RING ? (SIZE){22, 22}
                 : g <= G_LOCK ? (SIZE){g == G_RING ? 64 : 52, g == G_RING ? 64 : 52} : (SIZE){0, 30};
-        if (!sz.cx) // legends: measure the text first
-            sz.cx = g == G_MENU_LEGEND ? legend_width(sdc, menu_g, menu_t, 4, 0)
-                  : g == G_MAIN_LEGEND ? legend_width(sdc, main_g, main_t, 3, 0) : legend_width(sdc, assign_g, assign_t, 2, 0);
+        if (!sz.cx) sz.cx = LEGEND(sdc, g - G_LEGEND, 0); // legends: measure the text first
         DDSURFACEDESC2 d = {sizeof d};
         d.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
         d.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_VIDEOMEMORY; // GPU blits: system memory costs ~2 ms/frame on wined3d
@@ -786,9 +915,10 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
     if (aiming) put(back, G_RING, reticle.x, reticle.y);
     if (pad_mode && !world && !free_cursor && !IsRectEmpty(&focus)) frame(back, focus);
     if (cfg.hints && pad_mode) {
+        int legend = -1;
         if (world) {
             int n = art_slots();
-            for (int i = 0; i < n; i++) put(back, art_g[i], lt ? 362 - (n - 1 - i) * 67 : 670 + i * 67, 690);
+            for (int i = 0; i < n; i++) put(back, art_g[i], (lt ? weapon_slot(i) : art_slot(i)).x, 690);
             put(back, G_LT, 362 - n * 67 + 12, 712);
             put(back, G_UP, lt ? 513 : 452, 652), put(back, G_RIGHT, 483, 652), put(back, G_LEFT, 545, 652), put(back, G_DOWN, 576, 652);
             if (target && !cursor_mode && !aiming) {
@@ -796,11 +926,18 @@ static void draw_overlay(BYTE *drv, IDirectDrawSurface7 *back) {
                 put(back, G_A, target_pos.x, target_pos.y - above);
             }
             if (locked && target == locked) put(back, G_LOCK, target_pos.x, target_pos.y);
-        } else if (assigning) { // which button gets the art: the slots' buttons, and the prompt
-            for (int i = 0, n = art_slots(); i < n; i++) put(back, art_g[i], art_slot(i).x, 690);
-            put(back, G_ASSIGN_LEGEND, 12 + gsize[G_ASSIGN_LEGEND].cx / 2, 20);
-        } else if (!(in_world && legend_covered)) {
-            int g = in_world ? G_MENU_LEGEND : G_MAIN_LEGEND;
+            legend = lt ? L_LT : stand ? L_STAND : -1;
+        } else if (assigning) { // which button gets it: the slots' buttons, and the prompt
+            for (int i = 0, n = art_slots(); i < n; i++) put(back, art_g[i], (assign_kind == 2 ? weapon_slot(i) : art_slot(i)).x, 690);
+            legend = L_ASSIGN;
+        } else if (!in_world) legend = L_SELECT;
+        else if (carrying) legend = L_CARRY;
+        else if (fmodal[fpub] || npc_ok.x >= 0) legend = L_SELECT;
+        else if (wins & (1u << 1 | 1u << 4))
+            legend = legend_covered ? -1 : wins & 1u << 4 ? L_SHOP : focus_tag == TG_WEAPON ? L_WEAPON : focus_kind == F_ART ? L_ARTS : L_PANEL;
+        else legend = wins & (1u << 10 | 1u << 12) ? L_PAGES : L_SELECT; // quest log, game menu
+        if (legend >= 0) {
+            int g = G_LEGEND + legend;
             put(back, g, 12 + gsize[g].cx / 2, in_world ? 20 : 748);
         }
     }
@@ -870,7 +1007,7 @@ static void aim_action(void) {
     else force = 0, cursor_toward((POINT){hero_pos.x + lroundf(aim_x * 180), hero_pos.y + lroundf(aim_y * 135)});
 }
 
-static int walking, stand, acting;
+static int walking, acting;
 
 // Menus: focus moves between the published focusables; the (hidden) cursor sits on the focused one so the game's own
 // hover effects and tooltips show, and A/X click there. The right stick is a free cursor for anything not covered.
@@ -884,7 +1021,8 @@ static int focus_list(Focus *out) { // copy the published list; again if the ren
 }
 
 // The focusable nearest in direction (dx, dy) from the current focus: distance along the direction plus twice the
-// sideways offset, within a 60-degree-ish cone; items stacked on the same line win over diagonal ones.
+// sideways gap, within a cone; entries straight ahead win over diagonal ones.
+static int tall(RECT r) { return r.bottom - r.top > r.right - r.left; }
 static int step_focus(Focus *f, int n, int dx, int dy) {
     POINT c = centre(focus);
     int best = -1;
@@ -892,121 +1030,270 @@ static int step_focus(Focus *f, int n, int dx, int dy) {
     for (int i = 0; i < n; i++) {
         if (EqualRect(&f[i].r, &focus)) continue;
         POINT q = centre(f[i].r);
-        float along = (float)(q.x - c.x) * dx + (float)(q.y - c.y) * dy, across = fabsf((float)(q.x - c.x) * dy - (float)(q.y - c.y) * dx);
-        if (along < 4 || across > along * 1.8f) continue;
+        RECT *r = &f[i].r; // sideways: the gap to the entry's span (0 when it lies straight ahead, e.g. a wide slider)
+        int lo = dy ? r->left : r->top, hi = dy ? r->right : r->bottom, at = dy ? c.x : c.y;
+        float along = (float)(q.x - c.x) * dx + (float)(q.y - c.y) * dy, across = at < lo ? lo - at : at > hi ? at - hi : 0;
+        if (along < 4 || across > along * 2.5f) continue;
         if (along + 2 * across < bs) bs = along + 2 * across, best = i;
     }
     return best;
 }
 
-// Scripted clicks for multi-step UI actions (drag and drop): each click moves the cursor, waits, presses, releases.
-static POINT clicks[4];
-static int nclicks, click_step;
-static void queue_click(int x, int y) { if (nclicks < 4) clicks[nclicks++] = (POINT){x, y}; }
-static int run_clicks(void) { // 1 while busy
-    if (!nclicks) return 0;
-    int k = click_step / 24, t = click_step % 24; // ~190 ms per click: the game must see the cursor arrive first
-    if (t == 0) move_cursor(clicks[k].x - 1, clicks[k].y);
-    if (t == 6) move_cursor(clicks[k].x, clicks[k].y);
-    if (t == 12) key(VK_LBUTTON, 1);
-    if (t == 16) key(VK_LBUTTON, 0);
-    if (++click_step >= nclicks * 24) nclicks = click_step = 0;
+// Scripted UI steps (drag and drop, panel switching): a click moves the cursor, waits so the game sees it arrive,
+// then presses and releases (~190 ms); a key is tapped, then the next step waits ~130 ms for the screen to change.
+static struct { POINT p; int vk; } steps[8];
+static int nsteps, step_t;
+static void queue_click(int x, int y) { if (nsteps < 8) steps[nsteps].vk = 0, steps[nsteps++].p = (POINT){x, y}; }
+static void queue_key(int vk) { if (nsteps < 8) steps[nsteps++].vk = vk; }
+static int run_steps(void) { // 1 while busy
+    if (!nsteps) return 0;
+    int vk = steps[0].vk, t = step_t++;
+    POINT c = steps[0].p;
+    if (vk) { if (t == 0) tap(vk); }
+    else {
+        if (t == 0) move_cursor(c.x - 1, c.y);
+        if (t == 6) move_cursor(c.x, c.y);
+        if (t == 12) key(VK_LBUTTON, 1);
+        if (t == 16) key(VK_LBUTTON, 0);
+    }
+    if (step_t >= (vk ? 16 : 24)) memmove(steps, steps + 1, --nsteps * sizeof *steps), step_t = 0;
     return 1;
 }
 
+// The D2R-style panel cycle (Start opens it, LB/RB step through): backpack, combat arts, combo (the inventory's
+// tabs), the quest log's four tabs, then the game menu.
+enum { PG_INV = 0, PG_QUEST = 3, PG_MENU = 7, PG_N = 8 };
+static int cur_page(void) {
+    DWORD w = wins;
+    if (w & 1u << 12) return PG_MENU;
+    if (w & 1u << 10) return PG_QUEST + diary_tab % 4;
+    if ((w & 1u << 1) && !(w & 1u << 4) && inventory_sheet() >= 0) return PG_INV + pub_sheet_tab[inventory_sheet()];
+    return -1;
+}
+static int page_id(void) { // what LB / RB page through: a panel page, or the tab of a merchant's wares
+    int pg = cur_page();
+    for (int i = 0; i < pub_nsheets && (wins & 1u << 4); i++) if (pub_sheets[i].top < 100) pg = 100 + pub_sheet_tab[i];
+    return pg;
+}
+static int pending_page = -1;
+static DWORD pending_until, pending_click;
+static void click_tab(int page) { // a tab of the panel already open
+    POINT c;
+    if (page < PG_QUEST) {
+        RECT r = pub_sheets[inventory_sheet()];
+        c = (POINT){r.left + (int[]){73, 229, 391}[page], r.top};
+    } else c = centre(diary_tabs[page - PG_QUEST]);
+    free_cursor = 0;
+    queue_click(c.x, c.y);
+}
+static void goto_page(int page) {
+    int cur = cur_page();
+    if (cur < 0 || page == cur) return;
+    if (page != PG_MENU && (page < PG_QUEST) == (cur < PG_QUEST) && cur != PG_MENU) { click_tab(page); return; }
+    if (cur == PG_MENU) queue_key(VK_ESCAPE);                   // leave the game menu first
+    if (page == PG_MENU) queue_key(VK_ESCAPE), queue_key(VK_ESCAPE); // close the panel, open the menu
+    else queue_key(page < PG_QUEST ? 'I' : 'L');                 // the game swaps inventory <-> quest log itself
+    pending_page = page, pending_until = GetTickCount() + 2000, pending_click = 0;
+}
+static void settle_page(void) { // after a panel switch: click the wanted tab once the panel is up
+    if (pending_page < 0) return;
+    int cur = cur_page();
+    if (cur == pending_page || GetTickCount() > pending_until) { pending_page = -1; return; }
+    if (cur >= 0 && (cur < PG_QUEST) == (pending_page < PG_QUEST) && pending_page != PG_MENU && GetTickCount() > pending_click)
+        click_tab(pending_page), pending_click = GetTickCount() + 400;
+}
+
+// Per-screen memory: the focus last used on a screen comes back when the screen does (backing out of a sub-menu).
+static struct { int sig; RECT r; } screens[8];
+static int screen_sig(Focus *f, int n) { return n ? n * 7919 + f[0].r.left * 31 + f[0].r.top : 0; }
+static RECT *remembered(int sig) {
+    for (int i = 0; i < 8; i++) if (screens[i].sig == sig) return &screens[i].r;
+    return NULL;
+}
+static void remember(int sig, RECT r) {
+    static int next;
+    RECT *have = remembered(sig);
+    if (have) *have = r;
+    else screens[next].sig = sig, screens[next].r = r, next = (next + 1) % 8;
+}
+
+static int nav_held;          // a direction is held (also set on waking the pad, so that press doesn't move)
+static POINT want;            // focus the entry under this point when it shows up (e.g. Start Game after a hero)
+static DWORD want_until;
+static POINT origin;          // where the carried item was picked up: B / Start / Back put it back there
+static int a_consumed;        // A did something special this press: no plain click
+static int stow;              // after a scripted drop: if an item is left on the cursor, it goes to the backpack's free spot
+
+static int pick_initial(Focus *f, int n, int modal) { // a screen just appeared: where does the focus start?
+    RECT *r = modal == 1 ? NULL : remembered(screen_sig(f, n)); // pop-ups look alike: always start on Cancel
+    int best = 0;
+    float bs = 1e9f;
+    for (int i = 0; i < n; i++) {
+        if (r && EqualRect(r, &f[i].r)) return i;
+        POINT q = centre(f[i].r);
+        float sc = f[i].tag == TG_PREF ? -1e9f                                  // e.g. the game menu's Continue
+                 : modal == 1 ? -q.x                                            // pop-ups: the rightmost (Cancel)
+                 : (wins & 1u << 10) && EqualRect(&f[i].r, &diary_tabs[diary_tab % 4]) ? -1e8f // the quest log's open tab
+                 : q.y * 4.f + q.x + (f[i].kind == F_ITEM || f[i].kind == F_ART ? 0 : 1e6f); // the first item / art, else top-left
+        if (sc < bs) bs = sc, best = i;
+    }
+    return best;
+}
 
 static void update_menu(void) {
-    static Focus f[MAXF];
-    static int repeat, was_modal;
-    if (run_clicks()) return; // a scripted drag owns the cursor until it is done
+    static Focus f[MAXF], last[MAXF];
+    static int nlast, repeat, was_modal;
+    settle_page();
+    if (stow && !--stow && carrying && free_spot.x >= 0) queue_click(free_spot.x, free_spot.y);
     int n = focus_list(f), modal = fmodal[fpub];
-    if (modal != was_modal) SetRectEmpty(&focus), was_modal = modal; // a pop-up opened or closed: start afresh
 
-    // Keep the focus if it is still on screen; otherwise take the nearest (or the first for a new screen).
-    int cur = -1;
-    for (int i = 0; i < n; i++)
+    // Keep the focus if it is still on screen. Otherwise: a new screen (nothing in common with the last frame's
+    // list) starts at its remembered / preferred entry; on the same screen, the nearest entry takes over.
+    int cur = -1, overlap = 0;
+    for (int i = 0; i < n; i++) {
         if (EqualRect(&f[i].r, &focus)) cur = i;
+        for (int k = 0; k < nlast && !overlap; k++) overlap = EqualRect(&f[i].r, &last[k].r);
+    }
+    static int was_page = -1;
+    int page = page_id(); // another page / tab (LB, RB, A on a tab): start on its content, not where the focus was
+    if (modal != was_modal || (!overlap && nlast) || (page != was_page && page >= 0 && was_page >= 0)) SetRectEmpty(&focus), cur = -1;
+    was_modal = modal, was_page = page;
+    static int fresh; // a screen just appeared: its parts draw over a few frames, so the starting focus is re-picked
+    if (IsRectEmpty(&focus)) fresh = 12;
+    else if (fresh && n && --fresh) cur = -1, SetRectEmpty(&focus);
     if (cur < 0 && n) {
-        POINT c = centre(focus);
-        float bd = 1e9f;
-        for (int i = 0; i < n; i++) {
-            POINT q = centre(f[i].r);
-            float d = !IsRectEmpty(&focus) ? hypotf(q.x - c.x, q.y - c.y)
-                    : q.y * 4.f + q.x + (f[i].kind == F_ITEM ? 0 : 1e6f); // new screen: first item, else top-left
-            if (d < bd) bd = d, cur = i;
+        if (IsRectEmpty(&focus)) cur = pick_initial(f, n, modal);
+        else {
+            POINT c = centre(focus);
+            float bd = 1e9f;
+            for (int i = 0; i < n; i++) {
+                POINT q = centre(f[i].r);
+                float d = hypotf(q.x - c.x, q.y - c.y);
+                if (d < bd) bd = d, cur = i;
+            }
         }
         focus = f[cur].r;
         if (!free_cursor) move_cursor(centre(focus).x, centre(focus).y);
     }
     if (!n) SetRectEmpty(&focus);
+    memcpy(last, f, n * sizeof *f), nlast = n;
+    if (want_until) // a follow-up entry (Start Game, Load / Save) appeared: go there
+        for (int i = 0; i < n; i++)
+            if (PtInRect(&f[i].r, want) || GetTickCount() > want_until) {
+                if (GetTickCount() <= want_until) focus = f[cur = i].r, move_cursor(centre(focus).x, centre(focus).y), fresh = 0;
+                want_until = 0;
+                break;
+            }
+    if (cur >= 0) remember(screen_sig(f, n), focus);
+    int kind = cur >= 0 ? f[cur].kind : -1, tag = cur >= 0 ? f[cur].tag : 0;
+    focus_kind = kind, focus_tag = tag;
 
-    // D-pad or left stick: move focus (auto-repeat while held).
+    // D-pad or left stick: move the focus (auto-repeat while held). On a slider, its direction changes the value;
+    // past the end of a scrolled list (the saves), up/down scroll it.
     int dx = 0, dy = 0;
     if (DOWN(XINPUT_GAMEPAD_DPAD_LEFT) || pad.lx < -0.5f) dx = -1;
     if (DOWN(XINPUT_GAMEPAD_DPAD_RIGHT) || pad.lx > 0.5f) dx = 1;
     if (DOWN(XINPUT_GAMEPAD_DPAD_UP) || pad.ly > 0.5f) dy = -1;
     if (DOWN(XINPUT_GAMEPAD_DPAD_DOWN) || pad.ly < -0.5f) dy = 1;
     if (dy) dx = 0; // one axis at a time: vertical wins
-    static int held;
-    if (!dx && !dy) held = 0;
-    else if ((!held || --repeat <= 0) && n) {
-        int k = step_focus(f, n, dx, dy);
-        if (k >= 0) focus = f[k].r;
-        free_cursor = 0;
-        move_cursor(centre(focus).x, centre(focus).y);
-        repeat = held ? 12 : 30, held = 1; // 240 ms before repeating, then every 96 ms
+    if (!dx && !dy) nav_held = 0;
+    else if (n && (!nav_held || --repeat <= 0)) {
+        int k = cur, d = dx + dy;
+        if (kind != F_SLIDER || !(tall(f[cur].r) ? dy : dx)) k = step_focus(f, n, dx, dy);
+        if (k < 0 && dy) // nothing further: a scroll bar beside the list?
+            for (int i = 0; i < n; i++) if (f[i].kind == F_SLIDER && tall(f[i].r)) k = i;
+        if (k >= 0 && f[k].kind == F_SLIDER && (tall(f[k].r) ? dy : dx) && (k == cur || !dx))
+            queue_click(d < 0 ? f[k].a.x : f[k].b.x, d < 0 ? f[k].a.y : f[k].b.y);
+        else {
+            if (k >= 0) focus = f[k].r;
+            free_cursor = 0;
+            move_cursor(centre(focus).x, centre(focus).y);
+        }
+        repeat = nav_held ? 12 : 30, nav_held = 1, fresh = 0; // 240 ms before repeating, then every 96 ms
     }
     if (!free_cursor && n && cur >= 0) { // follow a focusable that moved (windows sliding in)
         POINT c = centre(focus);
         if (c.x != vcur.x || c.y != vcur.y) move_cursor(c.x, c.y);
     }
 
-    // Right stick: free cursor (also the fallback where nothing is focusable).
-    if (pad.rx || pad.ry) {
+    // Right stick: free cursor. Where nothing is focusable (the map), the left stick drives it too.
+    float cx = pad.rx + (n ? 0 : pad.lx), cy = pad.ry + (n ? 0 : pad.ly);
+    if (cx || cy) {
         static float fx, fy;
         if (!free_cursor) fx = vcur.x, fy = vcur.y;
         free_cursor = 1;
-        float m = fminf(hypotf(pad.rx, pad.ry), 1), v = (1.5f + 10 * m) * cfg.cursor_speed / 12.f;
-        fx += pad.rx * v, fy -= pad.ry * v;
+        float m = fminf(hypotf(cx, cy), 1), v = (1.5f + 10 * m) * cfg.cursor_speed / 12.f;
+        fx += cx * v, fy -= cy * v;
         move_cursor(lroundf(fx), lroundf(fy));
     }
     cursor_hidden = n && !free_cursor && !carrying;
     if (ctl_focus) {
         ctl_focus = 0;
         LOG("focus: %d items, focus %ld,%ld-%ld,%ld hidden=%d free=%d carrying=%d", n, focus.left, focus.top, focus.right, focus.bottom, cursor_hidden, free_cursor, carrying);
-        for (int i = 0; i < n; i++) LOG("focus  %d kind=%d %ld,%ld-%ld,%ld", i, f[i].kind, f[i].r.left, f[i].r.top, f[i].r.right, f[i].r.bottom);
+        for (int i = 0; i < n; i++) LOG("focus  %d kind=%d %ld,%ld-%ld,%ld tag=%d a=%ld,%ld b=%ld,%ld", i, f[i].kind, f[i].r.left, f[i].r.top, f[i].r.right, f[i].r.bottom, f[i].tag, f[i].a.x, f[i].a.y, f[i].b.x, f[i].b.y);
     }
 
-    int focus_kind = cur >= 0 ? f[cur].kind : -1;
-    if (assigning) { // pick the slot for the art under the focus
+    // Choosing a hotbar button for an art (X on an art) or a weapon (Y on an item).
+    if (assigning) {
         static const WORD slot_btn[] = {X, Y, B, RB, BTN_RT};
         for (int i = 0; i < 5; i++)
             if (PRESSED(slot_btn[i]) && i < art_slots()) {
-                POINT a = centre(focus), s = art_slot(i);
-                queue_click(a.x, a.y), queue_click(s.x, s.y); // pick the art up, drop it on the slot
+                POINT a = centre(focus), s = assign_kind == 2 ? weapon_slot(i) : art_slot(i);
+                queue_click(a.x, a.y), queue_click(s.x, s.y), origin = a, stow = 8; // pick it up, drop it on the slot
                 assigning = 0;
             }
         if (PRESSED(A) || PRESSED(XINPUT_GAMEPAD_START) || PRESSED(XINPUT_GAMEPAD_BACK) || PRESSED(LB)) assigning = 0;
+        a_consumed = DOWN(A);
         return;
     }
-    if (PRESSED(X) && focus_kind == F_ART) { assigning = 1; return; }
+    if ((PRESSED(X) || PRESSED(A)) && kind == F_ART) { assigning = 1, assign_kind = 1, a_consumed = DOWN(A); return; }
+    if (PRESSED(Y) && tag == TG_WEAPON && (wins & 1u << 1) && !(wins & 1u << 4)) { assigning = 1, assign_kind = 2; return; }
 
-    key(VK_LBUTTON, DOWN(A));
-    if (focus_kind != F_ART) key(VK_RBUTTON, DOWN(X)); // equip / use
-    if (PRESSED(B) && npc_ok.x >= 0) queue_click(npc_ok.x, npc_ok.y); // Esc doesn't close NPC text: its OK does
-    else if (PRESSED(B) || PRESSED(XINPUT_GAMEPAD_START)) tap(VK_ESCAPE);
-    if (PRESSED(XINPUT_GAMEPAD_BACK)) tap('I');
-    // LB/RB: focus and click the previous/next tab of the sheet holding the focus.
-    if ((PRESSED(LB) || PRESSED(RB)) && pub_nsheets) {
-        POINT c = centre(focus);
+    // A: click. Some entries do more: Quit asks first (the game's own question), a campaign picks the hero scene,
+    // a hero moves the focus to Start Game, a save moves it to Load (main menu) or Save (in the game).
+    if (PRESSED(A) && !carrying) origin = centre(focus);
+    if (PRESSED(A) && tag == TG_QUIT) tap(VK_ESCAPE), a_consumed = 1;
+    if (PRESSED(A) && (tag == TG_ANCARIA || tag == TG_UNDERWORLD)) campaign_uw = tag == TG_UNDERWORLD;
+    if (PRESSED(A) && tag == TG_PEDESTAL) want = (POINT){608, 716}, want_until = GetTickCount() + 1500;
+    if (PRESSED(A) && tag == TG_EDIT && (wins & 1u << 11))
+        want = (POINT){866, hero() ? 368 : 304}, want_until = GetTickCount() + 1500;
+    if (!DOWN(A)) a_consumed = 0;
+    key(VK_LBUTTON, DOWN(A) && !a_consumed);
+    key(VK_RBUTTON, DOWN(X) && kind != F_ART); // use / equip
+
+    // B, Start, Back: put a carried item back first; never close a panel with something on the cursor (a click in
+    // the world would drop it on the ground).
+    int back = PRESSED(B), start = PRESSED(XINPUT_GAMEPAD_START), view = PRESSED(XINPUT_GAMEPAD_BACK);
+    if ((back || start || view) && carrying) { // (where it came from, else the free spot)
+        if (origin.x || origin.y) queue_click(origin.x, origin.y), stow = 8, want = origin, want_until = GetTickCount() + 1500;
+        else if (free_spot.x >= 0) queue_click(free_spot.x, free_spot.y);
+        return;
+    }
+    if (back && modal == 1 && n) { // pop-ups: B is their last button (Cancel, or the only one)
         int k = 0;
-        for (int i = 0; i < pub_nsheets; i++) if (PtInRect(&pub_sheets[i], c)) k = i;
-        int t = (pub_sheet_tab[k] + (PRESSED(RB) ? 1 : 2)) % 3;
-        int x = pub_sheets[k].left + (int[]){73, 229, 391}[t], y = pub_sheets[k].top; // header centre
-        focus = (RECT){x - 70, y - 12, x + 70, y + 12}, free_cursor = 0;
-        queue_click(x, y);
+        for (int i = 1; i < n; i++) if (centre(f[i].r).x > centre(f[k].r).x) k = i;
+        queue_click(centre(f[k].r).x, centre(f[k].r).y);
+    } else if (back && npc_ok.x >= 0) queue_click(npc_ok.x, npc_ok.y); // Esc doesn't close NPC text: its OK does
+    else if (back || start) tap(VK_ESCAPE);
+    if (view && hero()) (wins & 1u << 5) ? tap(VK_ESCAPE) : (queue_key(VK_ESCAPE), queue_key('M')); // map
+
+    // LB/RB: a merchant's tabs while trading; otherwise the panel cycle; otherwise the tabs under the focus.
+    if ((PRESSED(LB) || PRESSED(RB)) && !carrying && !modal) {
+        int dir = PRESSED(RB) ? 1 : -1, page = cur_page();
+        if (!(wins & 1u << 4) && page >= 0) goto_page((page + dir + PG_N) % PG_N);
+        else if (pub_nsheets) {
+            POINT c = centre(focus);
+            int k = 0;
+            for (int i = 0; i < pub_nsheets; i++)
+                if ((wins & 1u << 4) ? pub_sheets[i].top < 100 : PtInRect(&pub_sheets[i], c)) k = i;
+            int t = (pub_sheet_tab[k] + dir + 3) % 3;
+            free_cursor = 0;
+            queue_click(pub_sheets[k].left + (int[]){73, 229, 391}[t], pub_sheets[k].top); // header centre
+        }
     }
 }
+
+static int woke; // the pad just took over from the mouse
 
 static void update(void) {
     int lt = DOWN(BTN_LT);
@@ -1014,12 +1301,18 @@ static void update(void) {
     int menu = !hero() || ui_open;
     static WORD swallow; // buttons held across a world/menu switch do nothing until released
     if (menu != was_menu) { // hand over cleanly between world and menu controls
-        key(VK_LBUTTON, 0), key(VK_RBUTTON, 0), key(VK_MENU, 0), key(VK_CONTROL, 0);
+        key(VK_LBUTTON, 0), key(VK_RBUTTON, 0), key(VK_MENU, 0), key(VK_CONTROL, 0), key(VK_TAB, 0);
         walking = acting = 0, walk_only = 0, force = -1, holding = 0;
         swallow = pad.btn & prev.btn;
     }
+    if (woke && menu) { // the first press only shows the focus, next to where the mouse left the cursor
+        swallow = pad.btn, nav_held = 1, free_cursor = 0;
+        focus = (RECT){vcur.x, vcur.y, vcur.x + 1, vcur.y + 1};
+    }
+    woke = 0;
     swallow &= pad.btn;
     pad.btn &= ~swallow;
+    if (run_steps()) return; // a scripted step owns the cursor until it is done (closing a panel on the way included)
     if (menu) {
         cursor_mode = 1, cursor_idle = 0;
         if (!was_menu) SetRectEmpty(&focus), free_cursor = ctl_cx >= 0, assigning = 0; // (a test-placed cursor stays free)
@@ -1030,6 +1323,7 @@ static void update(void) {
     cursor_hidden = !cursor_mode; // the world has no cursor on the pad; the right stick's manual aim shows it
 
     float m = hypotf(pad.lx, pad.ly);
+    steering = m > 0.2f;
     if (m > 0.2f) aim_x = pad.lx / m, aim_y = -pad.ly / m, cursor_mode = 0;
     loot_mode = DOWN(LB);
 
@@ -1096,6 +1390,7 @@ static void update(void) {
 
     // A: left click on the target (attack / talk / open / pick up); X Y B RB RT: right click with the selected art.
     holding = act || casting;
+    key(VK_CONTROL, stand && holding); // stand still: Ctrl makes the game attack in place instead of walking up
     if (act || casting) {
         aim_action();
         if (!acting) acting = 1; // first frame: cursor placed above, buttons below
@@ -1115,11 +1410,11 @@ static void update(void) {
     if (PRESSED(XINPUT_GAMEPAD_DPAD_LEFT)) tap('E');
     if (PRESSED(XINPUT_GAMEPAD_DPAD_DOWN)) tap('R');
 
-    if (PRESSED(XINPUT_GAMEPAD_START)) tap(lt ? 'L' : VK_ESCAPE);
-    if (PRESSED(XINPUT_GAMEPAD_BACK)) tap(lt ? 'M' : 'I');
+    if (PRESSED(XINPUT_GAMEPAD_START)) tap(lt ? VK_F9 : 'I');  // the panels (LB / RB page through them); quick save
+    if (PRESSED(XINPUT_GAMEPAD_BACK) && !lt) tap('M');    // map
+    key(VK_TAB, lt && DOWN(XINPUT_GAMEPAD_BACK));          // minimap, while held
     key(VK_MENU, DOWN(LB)); // show names
     if (PRESSED(L3)) stand = !stand;
-    key(VK_CONTROL, stand); // Ctrl: stop and attack instead of walking
 }
 
 static void tick(void) {
@@ -1128,7 +1423,11 @@ static void tick(void) {
     if (pad.lt > 0.5f) pad.btn |= BTN_LT;
     if (pad.rt > 0.5f) pad.btn |= BTN_RT;
     pad_shown = pad.btn;
-    if (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) pad_mode = 1;
+    if (!pad_mode && (pad.btn || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt)) {
+        pad_mode = 1, woke = 1;
+        POINT p;
+        if (real_GetCursorPos(&p) && ScreenToClient(game, &p)) vcur = p;
+    }
     if (ctl_cx >= 0) pad_mode = 1, cursor_mode = 1, cursor_idle = 0, free_cursor = 1, move_cursor(ctl_cx, ctl_cy);
     static int last_open = -1;
     if (ui_open != last_open) LOG("ui open=%d focusables=%d", ui_open, fcount[fpub]), last_open = ui_open;
