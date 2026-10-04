@@ -65,7 +65,8 @@ effects and item tooltips show for whatever is focused.
 
 In grids, focus jumps item to item; while an item is picked up it moves cell by cell so you can place it.
 Tabs (backpack / combat arts / combo, a merchant's weapons / armour / misc) are focus stops above their
-grid; LB / RB switch the tabs of the grid you're in. Pop-ups ("Load game?", "Quit?") take the focus until
+grid; LB / RB switch the tabs of the grid you're in. On the Combat Arts and Combo tabs, focus moves between
+your learned arts and the combo slots. Pop-ups ("Load game?", "Quit?") take the focus until
 they close. Merchants, smiths and combat masters are targets in the world: walk toward one and press A.
 
 The mouse keeps working: moving it hands the cursor back until you touch the pad again.

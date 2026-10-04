@@ -114,7 +114,10 @@ Delivered as a drop-in DLL; the game files themselves are never patched.
 - NPC dialog answers are drawn by cUI_Tooltip itself: 4 records of 0x14 at +0x2180 (+4 x, +8 y, +0xc w,
   +0xe h, relative to the dialog). Confirmation pop-ups: cUI_BusyDlg (render 0x721b10, called every frame,
   visible or not); its buttons are parentless, so the modal set = what draws after it.
-- Tab sheets: cUI_TabSheet (render 0x7297f0) draws its header row 26 px above the sheet, tabs at +73/+229/+391.
+- Tab sheets: cUI_TabSheet (render 0x7297f0) draws its header row 26 px above the sheet (centre = sheet y - 26),
+  tabs at +73/+229/+391. Combat Arts tab (cUI_SpellTab, render 0x6c25a0): icons are 16-byte records at
+  +0x2cc..+0x2d0 (+0 bit 0 learned, +4/+6 screen x/y, 64x64). Combo tab (cUI_ComboTab, render 0x6bf6f0):
+  4 slot controls at +0x154..+0x160.
 - Traders: creature +0x200 flags 0x1000 smith, 0x2000 merchant, 0x4000 combat master, 0x4000000 horse trader
   (has_dialog is 0 for them). The game swaps window procedures through a delay-loaded SetWindowLongA pointer
   (0xa23fb4): redirected so the mod's procedure stays first. The pad's own mouse messages carry MK 0x8000

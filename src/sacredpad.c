@@ -457,6 +457,27 @@ static void __fastcall h_sheet_render(Ctl *c, void *edx, void *dev) {
     sheet_render(c, edx, dev);
 }
 
+// The inventory's Combat Arts tab (cUI_SpellTab) draws its art icons itself: 16-byte records at +0x2cc..+0x2d0
+// (+0 bit 0 present, +4/+6 screen x/y, 64x64). The Combo tab's four slots are controls at +0x154..+0x160.
+static void (__fastcall *spell_render)(void *, void *, void *) = (void *)0x6c25a0;
+static void __fastcall h_spell_render(Ctl *c, void *edx, void *dev) {
+    BYTE *b = *(BYTE **)((BYTE *)c + 0x2cc), *e = *(BYTE **)((BYTE *)c + 0x2d0);
+    if ((c->flags & 1) && b && e > b && e - b <= 64 * 16 && !IsBadReadPtr(b, e - b))
+        for (; b < e; b += 16)
+            if (*b & 1) add_focus((RECT){*(short *)(b + 4), *(short *)(b + 6), *(short *)(b + 4) + 64, *(short *)(b + 6) + 64}, F_SLOT);
+    spell_render(c, edx, dev);
+}
+static void (__fastcall *combo_render)(void *, void *, void *) = (void *)0x6bf6f0;
+static void __fastcall h_combo_render(Ctl *c, void *edx, void *dev) {
+    if (c->flags & 1)
+        for (Ctl **k = (Ctl **)((BYTE *)c + 0x154); k <= (Ctl **)((BYTE *)c + 0x160); k++)
+            if (ctl_ok(*k)) {
+                POINT p = ctl_pos(*k);
+                add_focus((RECT){p.x, p.y, p.x + (*k)->w, p.y + (*k)->h}, F_SLOT);
+            }
+    combo_render(c, edx, dev);
+}
+
 // The confirmation pop-up's draw (cUI_BusyDlg, vtable slot 5): what is recorded after it starts is the pop-up's.
 static volatile int modal_mark = -1;
 static void (__fastcall *busy_render)(void *, void *, void *) = (void *)0x721b10;
@@ -468,8 +489,11 @@ static void hook_renders(void) {
     void **slot = (void **)0x897134 + 5;
     DWORD old;
     VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_busy_render, VirtualProtect(slot, 4, old, &old);
-    slot = (void **)0x897258 + 5;
-    VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = h_sheet_render, VirtualProtect(slot, 4, old, &old);
+    static const struct { DWORD vt; void *fn; } own[] = {{0x897258, h_sheet_render}, {0x896610, h_spell_render}, {0x896578, h_combo_render}};
+    for (int i = 0; i < 3; i++) {
+        slot = (void **)own[i].vt + 5;
+        VirtualProtect(slot, 4, PAGE_READWRITE, &old), *slot = own[i].fn, VirtualProtect(slot, 4, old, &old);
+    }
     for (int i = 0; clickable[i].vt; i++) {
         void **slot = (void **)clickable[i].vt + 5;
         DWORD old;
@@ -945,7 +969,7 @@ static void update_menu(void) {
         int k = 0;
         for (int i = 0; i < pub_nsheets; i++) if (PtInRect(&pub_sheets[i], c)) k = i;
         tabs[k] = (tabs[k] + (PRESSED(RB) ? 1 : 2)) % 3;
-        int x = pub_sheets[k].left + (int[]){73, 229, 391}[tabs[k]], y = pub_sheets[k].top + 14;
+        int x = pub_sheets[k].left + (int[]){73, 229, 391}[tabs[k]], y = pub_sheets[k].top; // header centre
         focus = (RECT){x - 70, y - 12, x + 70, y + 12}, free_cursor = 0;
         move_cursor(x, y), key(VK_LBUTTON, 1), release = 2;
     }
